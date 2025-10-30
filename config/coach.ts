@@ -4,9 +4,6 @@ export type ScoreRule = {
   target: number
   tolerance: number
   unit?: 'deg' | 's' | 'pct' | string
-  // 'closer' = 越接近越好
-  // '>=|'   = 大于等于最好
-  // '<=|'   = 小于等于最好
   better?: 'closer' | '>=|' | '<=|'
 }
 
@@ -23,11 +20,22 @@ export type WeightBucket = {
   items: CoachItem[]
 }
 
+export type ReleaseDetectConfig = {
+  minElbowDeg?: number
+  bodyWidthScale?: number
+}
+
 export type CoachConfig = {
+  releaseDetect?: ReleaseDetectConfig
   weights: WeightBucket[]
 }
 
 export const DEFAULT_CONFIG: CoachConfig = {
+  // 给 release.ts 用的配置
+  releaseDetect: {
+    minElbowDeg: 150,
+    bodyWidthScale: 3,
+  },
   weights: [
     {
       name: '下肢动力链',
@@ -38,7 +46,6 @@ export const DEFAULT_CONFIG: CoachConfig = {
           label: '下蹲深度(膝角)',
           weight: 0.5,
           rule: {
-            // 目标膝角（你可以再调）
             target: 95,
             tolerance: 35,
             unit: 'deg',
@@ -101,7 +108,7 @@ export const DEFAULT_CONFIG: CoachConfig = {
           weight: 0.2,
           rule: {
             target: 0,
-            tolerance: 0.3, // 原来是 0.20，这里放宽，避免一上来就 0 分
+            tolerance: 0.3, // 稍微放宽，别老 0 分
             unit: 'pct',
             better: '<=|',
           },
@@ -129,7 +136,7 @@ export const DEFAULT_CONFIG: CoachConfig = {
           weight: 0.5,
           rule: {
             target: 0,
-            tolerance: 0.12, // 原来是 0.08，稍微放宽
+            tolerance: 0.12, // 放宽
             unit: 'pct',
             better: '<=|',
           },
