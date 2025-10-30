@@ -9,7 +9,7 @@ import { scoreAngles } from '@/lib/score/scorer'
 import { computeAngles } from '@/lib/analyze/kinematics'
 import { detectRelease, type Sample } from '@/lib/analyze/release'
 
-// 和原项目一致：红=上肢，蓝=躯干，绿=下肢
+// 三色骨架：红=上肢，蓝=躯干，绿=下肢
 const SEG: Record<'red' | 'blue' | 'green', [string, string][]> = {
   red: [
     ['left_shoulder', 'left_elbow'],
@@ -31,10 +31,10 @@ const SEG: Record<'red' | 'blue' | 'green', [string, string][]> = {
   ],
 }
 
-// UI 层的“别太难看”的最低分
+// 展示层的最低分
 const UI_SOFT_FLOOR = 55
 
-// 英文单位 → 中文单位
+// 单位中文
 const UNIT_CN: Record<string, string> = {
   deg: '度',
   s: '秒',
@@ -58,7 +58,7 @@ export default function VideoAnalyzer() {
     setPose(p)
   }, [coach])
 
-  // 选视频
+  // 上传视频
   const handleFile = (e: React.ChangeEvent<HTMLInputElement>) => {
     const f = e.target.files?.[0]
     if (!f) return
@@ -67,7 +67,7 @@ export default function VideoAnalyzer() {
     setScore(null)
   }
 
-  // 在“原视频上”画姿态（关键：canvas 盖在 video 上）
+  // 在“原视频上”画姿态
   const drawPose = (res: any) => {
     const canvas = canvasRef.current
     const video = videoRef.current
@@ -75,18 +75,18 @@ export default function VideoAnalyzer() {
     const ctx = canvas.getContext('2d')
     if (!ctx) return
 
-    // 用元素实际显示的尺寸来画，这样竖视频也能对上
+    // 用显示尺寸，兼容竖视频
     const displayW = video.clientWidth || video.videoWidth || 640
     const displayH = video.clientHeight || video.videoHeight || 360
 
     canvas.width = displayW
     canvas.height = displayH
 
-    // 先画出原视频帧
+    // 先把视频帧画上去
     ctx.clearRect(0, 0, displayW, displayH)
     ctx.drawImage(video, 0, 0, displayW, displayH)
 
-    // 建 keypoint map
+    // keypoint map
     const map: Record<string, { x: number; y: number }> = {}
     res.keypoints.forEach((k: any) => {
       if (!k?.name) return
@@ -107,7 +107,7 @@ export default function VideoAnalyzer() {
       })
     }
 
-    // 下肢绿、躯干蓝、上肢红（和你发的图2一样）
+    // 按照你原来的那种颜色来
     drawSeg(SEG.green, 'rgba(34,197,94,0.95)')
     drawSeg(SEG.blue, 'rgba(59,130,246,0.95)')
     drawSeg(SEG.red, 'rgba(248,113,113,1)')
@@ -122,7 +122,7 @@ export default function VideoAnalyzer() {
     })
   }
 
-  // 分析
+  // 点击“开始分析”
   const handleAnalyze = async () => {
     const video = videoRef.current
     if (!video || !pose) return
@@ -135,7 +135,7 @@ export default function VideoAnalyzer() {
     const samples: Sample[] = []
     const start = performance.now()
 
-    // 最多取 4 秒，够识别一次投篮
+    // 取 0~4 秒的帧
     while (video.currentTime <= (video.duration || 4) && video.currentTime <= 4) {
       const res = await pose.estimate(video)
       drawPose(res)
@@ -147,14 +147,12 @@ export default function VideoAnalyzer() {
       await new Promise((r) => setTimeout(r, 90))
     }
 
-    // ======================
-    //      特征计算
-    // ======================
+    // ===== 特征计算 =====
     const last = samples.at(-1)
     const kin = last ? computeAngles(last.pose) : {}
     const rel = detectRelease(samples, coach)
 
-    // 如果 kinematics 里没拿到膝角/出手角，这里再兜一层
+    // 再兜一层角度，防止“未检测”
     const getKP = (name: string) => last?.pose.keypoints.find((k: any) => k.name === name)
 
     const ensureAngle = (a: any, b: any, c: any) => {
@@ -168,7 +166,7 @@ export default function VideoAnalyzer() {
       return (Math.acos(Math.max(-1, Math.min(1, cos))) * 180) / Math.PI
     }
 
-    // 膝角左
+    // 左膝
     if (!kin.kneeL) {
       const lh = getKP('left_hip')
       const lk = getKP('left_knee')
@@ -177,7 +175,7 @@ export default function VideoAnalyzer() {
         kin.kneeL = ensureAngle(lh, lk, la)
       }
     }
-    // 膝角右
+    // 右膝
     if (!kin.kneeR) {
       const rh = getKP('right_hip')
       const rk = getKP('right_knee')
@@ -195,7 +193,6 @@ export default function VideoAnalyzer() {
       if (rs && re && rw) {
         kin.releaseAngle = ensureAngle(rs, re, rw)
       } else if (re && rw) {
-        // 兜底：前臂和竖直的夹角
         const dx = rw.x - re.x
         const dy = rw.y - re.y
         const forearmDeg = (Math.atan2(dy, dx) * 180) / Math.PI
@@ -203,17 +200,15 @@ export default function VideoAnalyzer() {
       }
     }
 
-    // 真正要喂给打分器的特征（优先用算到的）
+    // 要喂给打分器的特征
     const features: any = {
       kneeDepth: (() => {
         const l = kin.kneeL
         const r = kin.kneeR
-        if (typeof l === 'number' && typeof r === 'number') {
-          return Math.min(l, r)
-        }
+        if (typeof l === 'number' && typeof r === 'number') return Math.min(l, r)
         if (typeof l === 'number') return l
         if (typeof r === 'number') return r
-        return 110 // 实在没测到，给一个合理值
+        return 110
       })(),
       extendSpeed: 260,
       releaseAngle: kin.releaseAngle ?? 115,
@@ -224,10 +219,10 @@ export default function VideoAnalyzer() {
       alignment: rel.alignmentPct ?? 0.018,
     }
 
-    // 打分（这个打分器我们下面也给你了完整版）
+    // 评分
     let s = scoreAngles(features, coach)
 
-    // UI 层兜底：任何一项 < 55，就拉到 55
+    // UI 兜底：任何小于 55 的一律拉到 55
     s.buckets.forEach((b: any) => {
       b.items.forEach((it: any) => {
         if (!Number.isFinite(it.score) || it.score < UI_SOFT_FLOOR) {
@@ -262,13 +257,13 @@ export default function VideoAnalyzer() {
       }
       const release = upper.items.find((x: any) => x.key === 'releaseAngle')
       if (release && release.score < 70) {
-        out.push('出手角偏离最佳区间，出手时前臂再竖直一点。')
+        out.push('出手角稍偏，出手时前臂再竖直一点。')
       }
     }
     if (balance) {
       const align = balance.items.find((x: any) => x.key === 'alignment')
       if (align && align.score < 70) {
-        out.push('脚-髋-肩-腕没有完全对准篮筐，起跳前把脚尖和肩都对准。')
+        out.push('脚-髋-肩-腕没有完全对准篮筐，起手前把脚尖和肩都对准。')
       }
     }
     if (!out.length) {
@@ -279,7 +274,7 @@ export default function VideoAnalyzer() {
 
   return (
     <div className="space-y-4">
-      {/* 标题+build 标签，和你线上一样 */}
+      {/* 顶部 */}
       <div>
         <h1 className="text-2xl font-semibold text-slate-100">开始分析你的投篮</h1>
         <p className="text-xs text-slate-400 mt-1">BUILD: coach-v3.9-release+wrist+color</p>
@@ -308,7 +303,7 @@ export default function VideoAnalyzer() {
         </button>
       </div>
 
-      {/* 播放区：重点！canvas 盖在 video 上 */}
+      {/* 播放区：video + 盖上的姿态 */}
       <div className="relative w-full max-w-3xl rounded-lg overflow-hidden border border-slate-800 bg-slate-900">
         <video
           ref={videoRef}
