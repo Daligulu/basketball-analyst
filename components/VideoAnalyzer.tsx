@@ -9,7 +9,7 @@ import { scoreAngles } from '@/lib/score/scorer'
 import { computeAngles } from '@/lib/analyze/kinematics'
 import { detectRelease, type Sample } from '@/lib/analyze/release'
 
-// 和原项目一致的三色骨架
+// 和原项目一致：红=上肢，蓝=躯干，绿=下肢
 const SEG: Record<'red' | 'blue' | 'green', [string, string][]> = {
   red: [
     ['left_shoulder', 'left_elbow'],
@@ -31,10 +31,10 @@ const SEG: Record<'red' | 'blue' | 'green', [string, string][]> = {
   ],
 }
 
-// 没识别到也别掉太狠
-const SOFT_FLOOR = 55
+// UI 层的“别太难看”的最低分
+const UI_SOFT_FLOOR = 55
 
-// 英文单位 → 中文
+// 英文单位 → 中文单位
 const UNIT_CN: Record<string, string> = {
   deg: '度',
   s: '秒',
@@ -67,7 +67,7 @@ export default function VideoAnalyzer() {
     setScore(null)
   }
 
-  // 画和图一一样的姿态
+  // 在“原视频上”画姿态（关键：canvas 盖在 video 上）
   const drawPose = (res: any) => {
     const canvas = canvasRef.current
     const video = videoRef.current
@@ -75,16 +75,18 @@ export default function VideoAnalyzer() {
     const ctx = canvas.getContext('2d')
     if (!ctx) return
 
-    const vw = video.videoWidth || 640
-    const vh = video.videoHeight || 360
-    canvas.width = vw
-    canvas.height = vh
+    // 用元素实际显示的尺寸来画，这样竖视频也能对上
+    const displayW = video.clientWidth || video.videoWidth || 640
+    const displayH = video.clientHeight || video.videoHeight || 360
 
-    // 背景视频
-    ctx.clearRect(0, 0, vw, vh)
-    ctx.drawImage(video, 0, 0, vw, vh)
+    canvas.width = displayW
+    canvas.height = displayH
 
-    // 建一个 name → point 的索引
+    // 先画出原视频帧
+    ctx.clearRect(0, 0, displayW, displayH)
+    ctx.drawImage(video, 0, 0, displayW, displayH)
+
+    // 建 keypoint map
     const map: Record<string, { x: number; y: number }> = {}
     res.keypoints.forEach((k: any) => {
       if (!k?.name) return
@@ -105,12 +107,12 @@ export default function VideoAnalyzer() {
       })
     }
 
-    // 下肢绿、躯干蓝、上肢红
+    // 下肢绿、躯干蓝、上肢红（和你发的图2一样）
     drawSeg(SEG.green, 'rgba(34,197,94,0.95)')
     drawSeg(SEG.blue, 'rgba(59,130,246,0.95)')
     drawSeg(SEG.red, 'rgba(248,113,113,1)')
 
-    // 关键点红点
+    // 红色关键点
     ctx.fillStyle = 'rgba(248,113,113,1)'
     res.keypoints.forEach((k: any) => {
       if (!k?.x || !k?.y) return
@@ -120,7 +122,7 @@ export default function VideoAnalyzer() {
     })
   }
 
-  // 点击「开始分析」
+  // 分析
   const handleAnalyze = async () => {
     const video = videoRef.current
     if (!video || !pose) return
@@ -133,24 +135,86 @@ export default function VideoAnalyzer() {
     const samples: Sample[] = []
     const start = performance.now()
 
-    // 最多取 4s，足够做一次出手分析
+    // 最多取 4 秒，够识别一次投篮
     while (video.currentTime <= (video.duration || 4) && video.currentTime <= 4) {
       const res = await pose.estimate(video)
       drawPose(res)
+
       const now = performance.now()
       samples.push({ t: (now - start) / 1000, pose: res })
+
       if (video.ended || video.paused) break
       await new Promise((r) => setTimeout(r, 90))
     }
 
+    // ======================
+    //      特征计算
+    // ======================
     const last = samples.at(-1)
     const kin = last ? computeAngles(last.pose) : {}
     const rel = detectRelease(samples, coach)
 
-    // 这里就是我们要喂给打分器的“特征”
-    // ——没有的，就给一个合理的默认值，别让打分是 0
+    // 如果 kinematics 里没拿到膝角/出手角，这里再兜一层
+    const getKP = (name: string) => last?.pose.keypoints.find((k: any) => k.name === name)
+
+    const ensureAngle = (a: any, b: any, c: any) => {
+      const v1x = a.x - b.x
+      const v1y = a.y - b.y
+      const v2x = c.x - b.x
+      const v2y = c.y - b.y
+      const d1 = Math.hypot(v1x, v1y) || 1e-6
+      const d2 = Math.hypot(v2x, v2y) || 1e-6
+      const cos = (v1x * v2x + v1y * v2y) / (d1 * d2)
+      return (Math.acos(Math.max(-1, Math.min(1, cos))) * 180) / Math.PI
+    }
+
+    // 膝角左
+    if (!kin.kneeL) {
+      const lh = getKP('left_hip')
+      const lk = getKP('left_knee')
+      const la = getKP('left_ankle')
+      if (lh && lk && la) {
+        kin.kneeL = ensureAngle(lh, lk, la)
+      }
+    }
+    // 膝角右
+    if (!kin.kneeR) {
+      const rh = getKP('right_hip')
+      const rk = getKP('right_knee')
+      const ra = getKP('right_ankle')
+      if (rh && rk && ra) {
+        kin.kneeR = ensureAngle(rh, rk, ra)
+      }
+    }
+
+    // 出手角：肩-肘-腕
+    if (!kin.releaseAngle) {
+      const rs = getKP('right_shoulder')
+      const re = getKP('right_elbow')
+      const rw = getKP('right_wrist')
+      if (rs && re && rw) {
+        kin.releaseAngle = ensureAngle(rs, re, rw)
+      } else if (re && rw) {
+        // 兜底：前臂和竖直的夹角
+        const dx = rw.x - re.x
+        const dy = rw.y - re.y
+        const forearmDeg = (Math.atan2(dy, dx) * 180) / Math.PI
+        kin.releaseAngle = Math.abs(90 - forearmDeg)
+      }
+    }
+
+    // 真正要喂给打分器的特征（优先用算到的）
     const features: any = {
-      kneeDepth: Math.min(kin.kneeL ?? 110, kin.kneeR ?? 110),
+      kneeDepth: (() => {
+        const l = kin.kneeL
+        const r = kin.kneeR
+        if (typeof l === 'number' && typeof r === 'number') {
+          return Math.min(l, r)
+        }
+        if (typeof l === 'number') return l
+        if (typeof r === 'number') return r
+        return 110 // 实在没测到，给一个合理值
+      })(),
       extendSpeed: 260,
       releaseAngle: kin.releaseAngle ?? 115,
       wristFlex: kin.wristR ?? 35,
@@ -160,19 +224,19 @@ export default function VideoAnalyzer() {
       alignment: rel.alignmentPct ?? 0.018,
     }
 
-    // 先走统一打分
+    // 打分（这个打分器我们下面也给你了完整版）
     let s = scoreAngles(features, coach)
 
-    // UI 层再兜一层：任何 <55 的都拉到 55，符合你说的“评分不要出现过低”
+    // UI 层兜底：任何一项 < 55，就拉到 55
     s.buckets.forEach((b: any) => {
       b.items.forEach((it: any) => {
-        if (!Number.isFinite(it.score) || it.score < SOFT_FLOOR) {
-          it.score = SOFT_FLOOR
+        if (!Number.isFinite(it.score) || it.score < UI_SOFT_FLOOR) {
+          it.score = UI_SOFT_FLOOR
         }
       })
       const avg =
         b.items.reduce(
-          (sum: number, it: any) => sum + (Number.isFinite(it.score) ? it.score : SOFT_FLOOR),
+          (sum: number, it: any) => sum + (Number.isFinite(it.score) ? it.score : UI_SOFT_FLOOR),
           0,
         ) / Math.max(1, b.items.length)
       b.score = Math.round(avg)
@@ -185,7 +249,7 @@ export default function VideoAnalyzer() {
     setAnalyzing(false)
   }
 
-  // 根据得分拼几条中文建议
+  // 建议
   const suggestions: string[] = (() => {
     if (!score) return []
     const out: string[] = []
@@ -215,8 +279,11 @@ export default function VideoAnalyzer() {
 
   return (
     <div className="space-y-4">
-      {/* 顶部 build 标签 */}
-      <div className="text-xs text-slate-400">BUILD: coach-v3.9-release+wrist+color</div>
+      {/* 标题+build 标签，和你线上一样 */}
+      <div>
+        <h1 className="text-2xl font-semibold text-slate-100">开始分析你的投篮</h1>
+        <p className="text-xs text-slate-400 mt-1">BUILD: coach-v3.9-release+wrist+color</p>
+      </div>
 
       {/* 工具栏 */}
       <div className="flex flex-wrap gap-3 items-center">
@@ -241,8 +308,8 @@ export default function VideoAnalyzer() {
         </button>
       </div>
 
-      {/* 视频 + 姿态 */}
-      <div className="w-full max-w-3xl rounded-lg overflow-hidden border border-slate-800 bg-slate-900">
+      {/* 播放区：重点！canvas 盖在 video 上 */}
+      <div className="relative w-full max-w-3xl rounded-lg overflow-hidden border border-slate-800 bg-slate-900">
         <video
           ref={videoRef}
           src={videoUrl ?? undefined}
@@ -251,10 +318,10 @@ export default function VideoAnalyzer() {
           playsInline
           muted
         />
-        <canvas ref={canvasRef} className="w-full bg-slate-900" />
+        <canvas ref={canvasRef} className="pointer-events-none absolute inset-0 w-full h-full" />
       </div>
 
-      {/* 评分 + 雷达图 + 建议 */}
+      {/* 评分面板 */}
       {score && (
         <div className="space-y-3">
           <div className="text-lg font-semibold text-slate-100">总分：{score.total}</div>
