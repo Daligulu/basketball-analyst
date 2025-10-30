@@ -1,0 +1,9 @@
+{
+  "version": "v1.0.1",
+  "changes": [
+    "Score logic: support coach >=| and <=| mapping to higher/lower",
+    "UI: units from rule.unit; NaN shows as 未有效检测",
+    "Pose: lower-limb coloring fix (foot_index no longer red)",
+    "UX: total=0 hint for all invalid features"
+  ]
+}

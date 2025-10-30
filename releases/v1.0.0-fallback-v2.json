@@ -1,0 +1,7 @@
+{
+  "name": "v1.0.0-fallback-v2",
+  "commit": "0a093f831e2519cba6438ced73b55acc5fa8b3c3",
+  "branch": "release/v1.0.0-fallback-v2",
+  "notes": "Local-first loading with remote fallback, COOP/COEP headers, stable RAF loop, iOS play() fix, status with build tag.",
+  "created_at": "2025-10-26T00:00:00Z"
+}
