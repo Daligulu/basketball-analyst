@@ -39,18 +39,18 @@ export function computeAngles(pose: PoseResult): Angles {
     out.kneeR = angleABC(k.right_hip, k.right_knee, k.right_ankle)
   }
 
-  // 肘-出手角：肩-肘-腕
+  // 肩-肘-腕 = 出手角
   if (k.right_shoulder && k.right_elbow && k.right_wrist) {
     out.releaseAngle = angleABC(k.right_shoulder, k.right_elbow, k.right_wrist)
     out.elbowR = out.releaseAngle
   }
 
-  // 这里先简单把腕部发力留出来，你后面要真测 wrist flex 再补
+  // 腕部发力先给个默认
   if (k.right_wrist) {
-    out.wristR = 35 // 给个合理的默认值
+    out.wristR = 35
   }
 
-  // 对齐/平衡的一个简单指标（横向偏移的百分比）
+  // 横向偏移
   if (k.left_hip && k.right_hip && k.left_ankle && k.right_ankle && k.nose) {
     const hipMid = {
       x: (k.left_hip.x + k.right_hip.x) / 2,
