@@ -9,9 +9,7 @@ import { scoreAngles } from '@/lib/score/scorer'
 import { computeAngles } from '@/lib/analyze/kinematics'
 import { detectRelease, type Sample } from '@/lib/analyze/release'
 
-/**
- * 和之前一样的三段配色骨架
- */
+// 和原项目一致的三色骨架
 const SEG: Record<'red' | 'blue' | 'green', [string, string][]> = {
   red: [
     ['left_shoulder', 'left_elbow'],
@@ -33,53 +31,47 @@ const SEG: Record<'red' | 'blue' | 'green', [string, string][]> = {
   ],
 }
 
-/**
- * 低于这个值的项，说明我们其实是没抓到特别好的轨迹，就不要给 0 分了
- */
-const SOFT_FLOOR = 35
+// 没识别到也别掉太狠
+const SOFT_FLOOR = 55
+
+// 英文单位 → 中文
+const UNIT_CN: Record<string, string> = {
+  deg: '度',
+  s: '秒',
+  pct: '%',
+}
 
 export default function VideoAnalyzer() {
-  // 真正挂在页面上的 video、canvas
   const videoRef = useRef<HTMLVideoElement | null>(null)
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
 
-  // 状态
   const [videoUrl, setVideoUrl] = useState<string | null>(null)
   const [pose, setPose] = useState<PoseEngine | null>(null)
   const [coach, setCoach] = useState<CoachConfig>(DEFAULT_CONFIG)
-  const [samples, setSamples] = useState<Sample[]>([])
   const [score, setScore] = useState<any>(null)
   const [openCfg, setOpenCfg] = useState(false)
   const [analyzing, setAnalyzing] = useState(false)
 
-  /**
-   * 初始化姿态引擎
-   */
+  // 初始化姿态引擎
   useEffect(() => {
     const p = new PoseEngine(coach)
     setPose(p)
   }, [coach])
 
-  /**
-   * 选择视频
-   */
+  // 选视频
   const handleFile = (e: React.ChangeEvent<HTMLInputElement>) => {
     const f = e.target.files?.[0]
     if (!f) return
     const url = URL.createObjectURL(f)
     setVideoUrl(url)
     setScore(null)
-    setSamples([])
   }
 
-  /**
-   * 在 canvas 上画出当前帧的骨架
-   */
+  // 画和图一一样的姿态
   const drawPose = (res: any) => {
     const canvas = canvasRef.current
     const video = videoRef.current
     if (!canvas || !video) return
-
     const ctx = canvas.getContext('2d')
     if (!ctx) return
 
@@ -92,7 +84,7 @@ export default function VideoAnalyzer() {
     ctx.clearRect(0, 0, vw, vh)
     ctx.drawImage(video, 0, 0, vw, vh)
 
-    // keypoints map
+    // 建一个 name → point 的索引
     const map: Record<string, { x: number; y: number }> = {}
     res.keypoints.forEach((k: any) => {
       if (!k?.name) return
@@ -113,157 +105,144 @@ export default function VideoAnalyzer() {
       })
     }
 
-    drawSeg(SEG.green, 'rgba(45,212,191,0.9)')
-    drawSeg(SEG.blue, 'rgba(125,211,252,0.9)')
-    drawSeg(SEG.red, 'rgba(244,63,94,0.9)')
+    // 下肢绿、躯干蓝、上肢红
+    drawSeg(SEG.green, 'rgba(34,197,94,0.95)')
+    drawSeg(SEG.blue, 'rgba(59,130,246,0.95)')
+    drawSeg(SEG.red, 'rgba(248,113,113,1)')
 
-    // HUD
-    ctx.fillStyle = 'rgba(15,23,42,0.35)'
-    ctx.fillRect(12, 12, 160, 56)
-    ctx.fillStyle = '#e2e8f0'
-    ctx.font = '12px system-ui, -apple-system, BlinkMacSystemFont, Segoe UI'
-    ctx.fillText('AI 篮球分析（本地推理）', 20, 32)
-    ctx.fillText(new Date().toLocaleTimeString(), 20, 50)
+    // 关键点红点
+    ctx.fillStyle = 'rgba(248,113,113,1)'
+    res.keypoints.forEach((k: any) => {
+      if (!k?.x || !k?.y) return
+      ctx.beginPath()
+      ctx.arc(k.x, k.y, 5, 0, Math.PI * 2)
+      ctx.fill()
+    })
   }
 
-  /**
-   * 点「开始分析」
-   */
+  // 点击「开始分析」
   const handleAnalyze = async () => {
     const video = videoRef.current
     if (!video || !pose) return
 
-    // iOS 上必须先 play 一下
     try {
       await video.play()
     } catch {}
 
     setAnalyzing(true)
-    const collected: Sample[] = []
+    const samples: Sample[] = []
     const start = performance.now()
 
-    // 最长只看 4s，手机上更流畅
+    // 最多取 4s，足够做一次出手分析
     while (video.currentTime <= (video.duration || 4) && video.currentTime <= 4) {
       const res = await pose.estimate(video)
       drawPose(res)
-
       const now = performance.now()
-      collected.push({
-        t: (now - start) / 1000,
-        pose: res,
-      })
-
-      // 播完提前跳出
+      samples.push({ t: (now - start) / 1000, pose: res })
       if (video.ended || video.paused) break
-
-      // 控制一下频率，80~120ms 一帧
       await new Promise((r) => setTimeout(r, 90))
     }
 
-    setSamples(collected)
+    const last = samples.at(-1)
+    const kin = last ? computeAngles(last.pose) : {}
+    const rel = detectRelease(samples, coach)
 
-    // ======= 抽特征并打分 =======
-    const last = collected.at(-1)
-    const angles = last ? computeAngles(last.pose) : {}
-    const release = detectRelease(collected, coach)
-
+    // 这里就是我们要喂给打分器的“特征”
+    // ——没有的，就给一个合理的默认值，别让打分是 0
     const features: any = {
-      // 下肢
-      kneeDepth: Math.min(angles.kneeL ?? 0, angles.kneeR ?? 0),
-      extendSpeed: 260, // 没有速度，就给一条接近目标的常量，避免 0
-      // 上肢
-      releaseAngle: angles.releaseAngle,
-      wristFlex: angles.wristR,
+      kneeDepth: Math.min(kin.kneeL ?? 110, kin.kneeR ?? 110),
+      extendSpeed: 260,
+      releaseAngle: kin.releaseAngle ?? 115,
+      wristFlex: kin.wristR ?? 35,
       followThrough: 0.4,
-      // 这俩就是你截图里为 0 的：给到一个非常小但非 0 的百分比
-      elbowCurve: release.elbowCurvePct ?? 0.018,
-      stability: release.stabilityPct ?? 0.012,
-      alignment: release.alignmentPct ?? 0.018,
+      elbowCurve: rel.elbowCurvePct ?? 0.018,
+      stability: rel.stabilityPct ?? 0.012,
+      alignment: rel.alignmentPct ?? 0.018,
     }
 
-    // 走我们原来的通用打分器
-    const rawScore = scoreAngles(features, coach)
+    // 先走统一打分
+    let s = scoreAngles(features, coach)
 
-    // 👇 兜底：如果肘部路径 / 对齐算出来是 0，就给个不那么难看的分
-    rawScore.buckets.forEach((b: any) => {
+    // UI 层再兜一层：任何 <55 的都拉到 55，符合你说的“评分不要出现过低”
+    s.buckets.forEach((b: any) => {
       b.items.forEach((it: any) => {
-        if (
-          (it.key === 'elbowCurve' || it.key === 'alignment') &&
-          (it.score === 0 || Number.isNaN(it.score))
-        ) {
+        if (!Number.isFinite(it.score) || it.score < SOFT_FLOOR) {
           it.score = SOFT_FLOOR
         }
       })
-      // 按兜底后的 item 重算桶分
       const avg =
-        b.items.reduce((s: number, it: any) => s + (Number.isFinite(it.score) ? it.score : SOFT_FLOOR), 0) /
-        Math.max(1, b.items.length)
+        b.items.reduce(
+          (sum: number, it: any) => sum + (Number.isFinite(it.score) ? it.score : SOFT_FLOOR),
+          0,
+        ) / Math.max(1, b.items.length)
       b.score = Math.round(avg)
     })
-
-    // 总分也正常化一下
-    const totalWeight = rawScore.buckets.reduce((s: number, b: any) => s + 1, 0)
     const total =
-      rawScore.buckets.reduce((s: number, b: any) => s + b.score, 0) / Math.max(1, totalWeight)
-    rawScore.total = Math.round(total)
+      s.buckets.reduce((sum: number, b: any) => sum + b.score, 0) / Math.max(1, s.buckets.length)
+    s.total = Math.round(total)
 
-    setScore(rawScore)
+    setScore(s)
     setAnalyzing(false)
   }
 
-  /**
-   * 根据得分做几条「投篮建议」
-   */
+  // 根据得分拼几条中文建议
   const suggestions: string[] = (() => {
     if (!score) return []
     const out: string[] = []
     const upper = score.buckets.find((b: any) => b.name.includes('上肢'))
-    const balance = score.buckets.find((b: any) => b.name.includes('平衡'))
+    const balance = score.buckets.find((b: any) => b.name.includes('平衡') || b.name.includes('对齐'))
     if (upper) {
       const elbow = upper.items.find((x: any) => x.key === 'elbowCurve')
-      if (elbow && elbow.score < 60) {
-        out.push('肘部横向漂移有点大，尝试把肘尖指向篮筐，出手轨迹走直线。')
+      if (elbow && elbow.score < 70) {
+        out.push('肘部路径有横向漂移，出手时让肘尖朝向篮筐，手肘不要外展。')
+      }
+      const release = upper.items.find((x: any) => x.key === 'releaseAngle')
+      if (release && release.score < 70) {
+        out.push('出手角偏离最佳区间，出手时前臂再竖直一点。')
       }
     }
     if (balance) {
       const align = balance.items.find((x: any) => x.key === 'alignment')
-      if (align && align.score < 60) {
-        out.push('脚-髋-肩没有完全对齐篮筐，起跳前脚尖和肩尽量朝向目标。')
+      if (align && align.score < 70) {
+        out.push('脚-髋-肩-腕没有完全对准篮筐，起跳前把脚尖和肩都对准。')
       }
     }
-    if (!out.length) out.push('整体姿态不错，保持当前节奏，多拍几段视频形成基线。')
+    if (!out.length) {
+      out.push('整体姿态不错，保持当前节奏，多录几段做基线。')
+    }
     return out
   })()
 
   return (
     <div className="space-y-4">
-      {/* 工具栏：手机上竖排，PC 横排 */}
+      {/* 顶部 build 标签 */}
+      <div className="text-xs text-slate-400">BUILD: coach-v3.9-release+wrist+color</div>
+
+      {/* 工具栏 */}
       <div className="flex flex-wrap gap-3 items-center">
         <input
           type="file"
           accept="video/*"
           onChange={handleFile}
-          className="shrink-0 bg-slate-800 rounded px-3 py-2 text-sm"
+          className="shrink-0 bg-slate-100 text-slate-900 rounded px-3 py-2 text-sm"
         />
         <button
           onClick={() => setOpenCfg(true)}
-          className="px-3 py-2 rounded bg-emerald-500/90 text-sm font-medium hover:bg-emerald-400"
+          className="px-4 py-2 rounded bg-emerald-500 text-white text-sm font-medium"
         >
           配置
         </button>
         <button
           onClick={handleAnalyze}
           disabled={!videoUrl || !pose || analyzing}
-          className="px-3 py-2 rounded bg-sky-500/90 text-sm font-medium hover:bg-sky-400 disabled:opacity-50"
+          className="px-4 py-2 rounded bg-sky-500 text-white text-sm font-medium disabled:opacity-50"
         >
           {analyzing ? '识别中…' : '开始分析'}
         </button>
-        <span className="text-xs text-slate-400">iOS 建议选 3~5 秒的视频，人物要全身入镜。</span>
       </div>
 
-      {/* 播放区 + HUD */}
-      <div className="w-full max-w-3xl mx-auto rounded-lg overflow-hidden border border-slate-800 bg-slate-900">
-        {/* 真正的 video，要显示出来 */}
+      {/* 视频 + 姿态 */}
+      <div className="w-full max-w-3xl rounded-lg overflow-hidden border border-slate-800 bg-slate-900">
         <video
           ref={videoRef}
           src={videoUrl ?? undefined}
@@ -272,36 +251,39 @@ export default function VideoAnalyzer() {
           playsInline
           muted
         />
-        {/* 覆盖层画骨架 */}
         <canvas ref={canvasRef} className="w-full bg-slate-900" />
       </div>
 
-      {/* 打分面板 */}
+      {/* 评分 + 雷达图 + 建议 */}
       {score && (
         <div className="space-y-3">
           <div className="text-lg font-semibold text-slate-100">总分：{score.total}</div>
           <div className="grid gap-3 md:grid-cols-2">
             {score.buckets.map((b: any) => (
-              <div key={b.name} className="rounded-lg bg-slate-800/50 border border-slate-700/60 p-3">
-                <div className="flex items-center justify-between mb-2">
-                  <div className="text-slate-200">{b.name}</div>
-                  <div className="text-xl font-bold text-cyan-300">{b.score}</div>
+              <div key={b.name} className="rounded-lg bg-slate-800/40 border border-slate-700/50 p-3 space-y-2">
+                <div className="flex items-center justify-between">
+                  <div className="text-slate-100">{b.name}</div>
+                  <div className="text-cyan-300 text-xl font-bold">{b.score}</div>
                 </div>
-                <ul className="space-y-1 text-sm text-slate-300">
-                  {b.items.map((it: any) => (
-                    <li key={it.key} className="flex justify-between gap-4">
-                      <span>{it.label}</span>
-                      <span>
-                        {it.score}
-                        {typeof it.value === 'number'
-                          ? ` (${it.unit === 'pct'
-                              ? (it.value * 100).toFixed(2) + '%'
-                              : it.value.toFixed(2) + (it.unit ?? '')
-                            })`
-                          : ''}
-                      </span>
-                    </li>
-                  ))}
+                <ul className="space-y-1 text-sm text-slate-200">
+                  {b.items.map((it: any) => {
+                    const unit = it.unit ? UNIT_CN[it.unit] ?? it.unit : ''
+                    const hasValue = typeof it.value === 'number' && Number.isFinite(it.value)
+                    const shown = hasValue
+                      ? it.unit === 'pct'
+                        ? (it.value * 100).toFixed(2) + '%'
+                        : it.value.toFixed(2) + unit
+                      : '未检测'
+                    return (
+                      <li key={it.key} className="flex items-center justify-between gap-2">
+                        <span>{it.label}</span>
+                        <span>
+                          {it.score}
+                          {` (${shown})`}
+                        </span>
+                      </li>
+                    )
+                  })}
                 </ul>
               </div>
             ))}
@@ -312,10 +294,10 @@ export default function VideoAnalyzer() {
             <RadarChart data={score.buckets.map((b: any) => ({ label: b.name, value: b.score }))} />
           </div>
 
-          {/* 投篮建议 */}
-          <div className="rounded-lg bg-slate-800/40 border border-slate-700/40 p-3 space-y-2">
-            <div className="text-slate-200 font-medium">投篮优化建议</div>
-            <ul className="list-disc pl-5 text-slate-300 text-sm space-y-1">
+          {/* 建议 */}
+          <div className="rounded-lg bg-slate-800/30 border border-slate-700/30 p-3 space-y-2">
+            <div className="text-slate-100 font-medium">投篮优化建议</div>
+            <ul className="list-disc pl-5 text-slate-200 text-sm space-y-1">
               {suggestions.map((s) => (
                 <li key={s}>{s}</li>
               ))}
