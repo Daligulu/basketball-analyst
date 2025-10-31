@@ -18,24 +18,27 @@ async function headOk(url: string) {
   }
 }
 
-// 选出“最可能是投篮的人”
-function pickPrimaryPose(
-  poses: any[],
-  videoW: number,
-  videoH: number,
-): any | null {
+/**
+ * 从模型返回的多个人里挑“最像是投篮的人”
+ * 规则（从强到弱）：
+ * 1. 脚越接近画面底部越好（前景人）
+ * 2. 框越大越好（但不过分）
+ * 3. 越靠中间越好
+ * 4. 关键点平均分越高越好
+ */
+function pickPrimaryPose(poses: any[], videoW: number, videoH: number): any | null {
   if (!poses || !poses.length) return null
   if (poses.length === 1) return poses[0]
 
-  const cx = videoW / 2
-  const cy = videoH * 0.45 // 稍微靠上点，拍投篮一般取上半身
-
+  const imgCenterX = videoW / 2
   let best: any = null
   let bestScore = -Infinity
 
   for (const p of poses) {
-    const ks = (p.keypoints || []).filter((k: any) => k.score == null || k.score > 0.2)
+    const ks = (p.keypoints || []).filter((k: any) => k.score == null || k.score > 0.15)
     if (!ks.length) continue
+
+    // 基础框
     const xs = ks.map((k: any) => k.x)
     const ys = ks.map((k: any) => k.y)
     const minX = Math.min(...xs)
@@ -46,17 +49,27 @@ function pickPrimaryPose(
     const bboxH = maxY - minY
     const area = bboxW * bboxH
 
-    const px = (minX + maxX) / 2
-    const py = (minY + maxY) / 2
-    const centerDist = Math.hypot(px - cx, py - cy)
+    // 最低的点（越靠下越像前景）
+    const lowestY = maxY // y 越大越靠下
 
-    // 看看有没有脚踝，踝子在下面的更可能是整个人
-    const ra = ks.find((k: any) => k.name === 'right_ankle')
-    const la = ks.find((k: any) => k.name === 'left_ankle')
-    const ankleY = Math.max(ra?.y ?? 0, la?.y ?? 0)
+    // 在画面里的水平中心
+    const centerX = (minX + maxX) / 2
+    const centerDist = Math.abs(centerX - imgCenterX) // 越小越好
 
-    // 综合评分：面积越大越好，越在中间越好，脚越靠下越好
-    const score = area * 1.1 - centerDist * 0.4 + ankleY * 0.15
+    // 平均置信度
+    const avgScore =
+      ks.reduce((sum: number, k: any) => sum + (k.score ?? 0.5), 0) / Math.max(1, ks.length)
+
+    // 分数：把“脚在下面”权重拉高，把“在中间”也拉高
+    const score =
+      // 脚越靠下面越好
+      lowestY * 1.7 +
+      // 框越大越好
+      area * 0.35 +
+      // 越在中间越好
+      -centerDist * 0.6 +
+      // 置信度加一点
+      avgScore * 1200
 
     if (score > bestScore) {
       bestScore = score
@@ -129,6 +142,7 @@ export class PoseEngine {
   }
 
   private kpName(i: number) {
+    // 保持你项目里这套 keypoint 命名，末尾是脚尖
     const names = [
       'nose',
       'left_eye',
@@ -165,7 +179,7 @@ export class PoseEngine {
     const videoW = (video as any).videoWidth || (video as any).width || 720
     const videoH = (video as any).videoHeight || (video as any).height || 1280
 
-    // ⭐ 这里允许多人的情况
+    // ⭐ 一次取多个人
     const poses = await this.detector.estimatePoses(video as any, {
       maxPoses: 4,
       flipHorizontal: false,
@@ -208,7 +222,7 @@ export class PoseEngine {
       }
     })
 
-    // 可选智能裁剪
+    // 可选裁剪
     if (this.cfg.enableSmartCrop) {
       const xs = kps.map((k) => k.x)
       const ys = kps.map((k) => k.y)
