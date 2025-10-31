@@ -29,28 +29,23 @@ export function computeAngles(pose: PoseResult): Angles {
 
   const out: Angles = {}
 
-  // 左膝
   if (k.left_hip && k.left_knee && k.left_ankle) {
     out.kneeL = angleABC(k.left_hip, k.left_knee, k.left_ankle)
   }
 
-  // 右膝
   if (k.right_hip && k.right_knee && k.right_ankle) {
     out.kneeR = angleABC(k.right_hip, k.right_knee, k.right_ankle)
   }
 
-  // 肩-肘-腕 = 出手角
   if (k.right_shoulder && k.right_elbow && k.right_wrist) {
     out.releaseAngle = angleABC(k.right_shoulder, k.right_elbow, k.right_wrist)
     out.elbowR = out.releaseAngle
   }
 
-  // 腕部发力先给个默认
   if (k.right_wrist) {
     out.wristR = 35
   }
 
-  // 横向偏移
   if (k.left_hip && k.right_hip && k.left_ankle && k.right_ankle && k.nose) {
     const hipMid = {
       x: (k.left_hip.x + k.right_hip.x) / 2,
