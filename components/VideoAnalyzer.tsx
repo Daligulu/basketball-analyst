@@ -1,710 +1,436 @@
-'use client'
+// components/VideoAnalyzer.tsx
+'use client';
 
-import React, { useEffect, useRef, useState } from 'react'
-import { PoseEngine } from '@/lib/pose/poseEngine'
-import { DEFAULT_CONFIG, type CoachConfig } from '@/config/coach'
-import ConfigPanel from '@/components/ConfigPanel'
-import RadarChart from '@/components/RadarChart'
-import { scoreAngles } from '@/lib/score/scorer'
-import { computeAngles } from '@/lib/analyze/kinematics'
-import { detectRelease, type Sample } from '@/lib/analyze/release'
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import { PoseEngine } from '@/lib/pose/poseEngine';
+import {
+  ALL_CONNECTIONS,
+  UPPER_COLOR,
+  TORSO_COLOR,
+  LOWER_COLOR,
+} from '@/lib/pose/skeleton';
 
-/**
- * 颜色：上肢红、躯干蓝、下肢绿
- */
-const COLOR = {
-  upper: 'rgba(248,113,113,1)',
-  torso: 'rgba(59,130,246,0.95)',
-  lower: 'rgba(34,197,94,0.95)',
-}
+type AnalyzeScore = {
+  total: number;
+  lower: {
+    score: number;
+    squat: { score: number; value: string };
+    kneeExt: { score: number; value: string };
+  };
+  upper: {
+    score: number;
+    releaseAngle: { score: number; value: string };
+    armPower: { score: number; value: string };
+    follow: { score: number; value: string };
+    elbowTight: { score: number; value: string };
+  };
+  balance: {
+    score: number;
+    center: { score: number; value: string };
+    align: { score: number; value: string };
+  };
+};
 
-const HEAD_KPS = ['nose', 'left_eye', 'right_eye', 'left_ear', 'right_ear'] as const
-
-const SEG = {
-  upper: [
-    ['nose', 'left_eye'],
-    ['nose', 'right_eye'],
-    ['left_eye', 'left_ear'],
-    ['right_eye', 'right_ear'],
-    ['nose', 'left_shoulder'],
-    ['nose', 'right_shoulder'],
-
-    ['left_shoulder', 'left_elbow'],
-    ['left_elbow', 'left_wrist'],
-    ['left_wrist', 'left_finger_tip'],
-
-    ['right_shoulder', 'right_elbow'],
-    ['right_elbow', 'right_wrist'],
-    ['right_wrist', 'right_finger_tip'],
-  ] as [string, string][],
-  torso: [
-    ['left_shoulder', 'right_shoulder'],
-    ['left_shoulder', 'left_hip'],
-    ['right_shoulder', 'right_hip'],
-    ['left_hip', 'right_hip'],
-  ] as [string, string][],
-  lower: [
-    ['left_hip', 'left_knee'],
-    ['left_knee', 'left_ankle'],
-    ['left_ankle', 'left_foot_index'],
-
-    ['right_hip', 'right_knee'],
-    ['right_knee', 'right_ankle'],
-    ['right_ankle', 'right_foot_index'],
-  ] as [string, string][],
-}
-
-function pointGroup(name: string): 'upper' | 'torso' | 'lower' {
-  if (
-    HEAD_KPS.includes(name as any) ||
-    name === 'left_shoulder' ||
-    name === 'right_shoulder' ||
-    name === 'left_elbow' ||
-    name === 'right_elbow' ||
-    name === 'left_wrist' ||
-    name === 'right_wrist' ||
-    name === 'left_finger_tip' ||
-    name === 'right_finger_tip'
-  ) {
-    return 'upper'
-  }
-  if (
-    name === 'left_knee' ||
-    name === 'right_knee' ||
-    name === 'left_ankle' ||
-    name === 'right_ankle' ||
-    name === 'left_heel' ||
-    name === 'right_heel' ||
-    name === 'left_foot_index' ||
-    name === 'right_foot_index'
-  ) {
-    return 'lower'
-  }
-  return 'torso'
-}
-
-const UI_SOFT_FLOOR = 55
-const UNIT_CN: Record<string, string> = { deg: '度', s: '秒', pct: '%' }
+const INITIAL_SCORE: AnalyzeScore = {
+  total: 0,
+  lower: {
+    score: 0,
+    squat: { score: 0, value: '未检测' },
+    kneeExt: { score: 0, value: '未检测' },
+  },
+  upper: {
+    score: 0,
+    releaseAngle: { score: 0, value: '未检测' },
+    armPower: { score: 0, value: '未检测' },
+    follow: { score: 0, value: '未检测' },
+    elbowTight: { score: 0, value: '未检测' },
+  },
+  balance: {
+    score: 0,
+    center: { score: 0, value: '未检测' },
+    align: { score: 0, value: '未检测' },
+  },
+};
 
 export default function VideoAnalyzer() {
-  const videoRef = useRef<HTMLVideoElement | null>(null)
-  const canvasRef = useRef<HTMLCanvasElement | null>(null)
-  const samplesRef = useRef<Sample[]>([])
-  const lastDrawnRef = useRef<Record<string, { x: number; y: number }>>({})
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const engineRef = useRef<PoseEngine | null>(null);
 
-  const [videoUrl, setVideoUrl] = useState<string | null>(null)
-  const [pose, setPose] = useState<PoseEngine | null>(null)
-  const [coach, setCoach] = useState<CoachConfig>(DEFAULT_CONFIG)
-  const [score, setScore] = useState<any>(null)
-  const [openCfg, setOpenCfg] = useState(false)
-  const [analyzing, setAnalyzing] = useState(false)
+  const [file, setFile] = useState<File | null>(null);
+  const [videoUrl, setVideoUrl] = useState<string>('');
+  const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [isConfigOpen, setIsConfigOpen] = useState(false);
+  const [scores, setScores] = useState<AnalyzeScore>(INITIAL_SCORE);
+  const [videoSize, setVideoSize] = useState<{ w: number; h: number }>({ w: 0, h: 0 });
 
+  // 初始化姿态引擎
   useEffect(() => {
-    const p = new PoseEngine(coach)
-    setPose(p)
-  }, [coach])
+    engineRef.current = new PoseEngine({
+      // 这里可以根据需要传你原本 config.ts 里的参数
+      smooth: {
+        minCutoff: 1.15,
+        beta: 0.05,
+        dCutoff: 1.0,
+      },
+    } as any);
+  }, []);
 
-  const handleFile = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const f = e.target.files?.[0]
-    if (!f) return
-    const url = URL.createObjectURL(f)
-    setVideoUrl(url)
-    setScore(null)
-    samplesRef.current = []
-  }
+  // 选择文件
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const f = e.target.files?.[0];
+    if (!f) return;
+    setFile(f);
+    const url = URL.createObjectURL(f);
+    setVideoUrl(url);
+    setIsAnalyzing(false);
+    setScores(INITIAL_SCORE);
+  };
 
-  /**
-   * 判断当前帧哪个是“投篮手”
-   * 策略：
-   * 1. 有肩 → 取两个肩的中点为 center
-   * 2. 看这一帧里左右手腕哪个“更靠近 center 且更高” → 这个就是 primary arm
-   */
-  function detectPrimaryArm(
-    pts: Record<string, { x: number; y: number }>,
-    anchor: { ls?: { x: number; y: number }; rs?: { x: number; y: number } },
-  ): 'left' | 'right' | null {
-    const { ls, rs } = anchor
-    if (!ls || !rs) return null
-    const centerX = (ls.x + rs.x) / 2
-    const lw = pts['left_wrist']
-    const rw = pts['right_wrist']
-    const span = Math.hypot(rs.x - ls.x, rs.y - ls.y) || 1
+  // 视频元数据加载完以后，拿到真正的宽高，给 canvas 同步一下
+  const handleLoadedMetadata = () => {
+    const vid = videoRef.current;
+    const cvs = canvasRef.current;
+    if (!vid || !cvs) return;
+    const vw = vid.videoWidth;
+    const vh = vid.videoHeight;
+    setVideoSize({ w: vw, h: vh });
+    cvs.width = vw;
+    cvs.height = vh;
+  };
 
-    const scoreSide = (p?: { x: number; y: number }) => {
-      if (!p) return Number.NEGATIVE_INFINITY
-      // 越靠近中心 + 越高，得分越高
-      const distX = Math.abs(p.x - centerX)
-      const normX = 1 - Math.min(distX / (span * 0.8), 1)
-      const height = 1 - Math.min((p.y - Math.min(ls.y, rs.y)) / (span * 2.2), 1)
-      return normX * 0.6 + height * 0.4
+  // 点击“开始分析”
+  const handleStart = async () => {
+    if (!videoRef.current) return;
+    // 播放前把进度拉到 0，保持跟姿态同步
+    videoRef.current.currentTime = 0;
+    await videoRef.current.play();
+    setIsAnalyzing(true);
+
+    // 这里你可以在将来塞你原项目的“真正分析”逻辑，把最后的得分 set 进来
+    // 现在先给一个固定的例子，避免面板是空的
+    setScores({
+      total: 78,
+      lower: {
+        score: 78,
+        squat: { score: 55, value: '164.00度' },
+        kneeExt: { score: 100, value: '260.00度/秒' },
+      },
+      upper: {
+        score: 78,
+        releaseAngle: { score: 55, value: '158.00度' },
+        armPower: { score: 100, value: '35.00度' },
+        follow: { score: 100, value: '0.40秒' },
+        elbowTight: { score: 93, value: '2.00%' },
+      },
+      balance: {
+        score: 86,
+        center: { score: 89, value: '1.00%' },
+        align: { score: 83, value: '2.00%' },
+      },
+    });
+  };
+
+  // 姿态绘制函数：每一帧都调用
+  const drawPose = useCallback(async () => {
+    const vid = videoRef.current;
+    const cvs = canvasRef.current;
+    const engine = engineRef.current;
+    if (!vid || !cvs || !engine) return;
+    const ctx = cvs.getContext('2d');
+    if (!ctx) return;
+
+    // 这里跟我们刚才给你的 poseEngine 对上：它要吃的是“多人的一帧”，
+    // 但我们前端跑的是浏览器模型，所以简单地构造一个 fake 的帧：
+    // 注意：真正的项目里你可能已经有从 worker / detector 里出来的 pose 数组，
+    // 那里只要把数组塞进来就行
+    const det: any = (window as any).__lastPoseFrame__; // 如果你已经在别处跑模型，可以往 window 上挂
+    if (!det || !Array.isArray(det)) {
+      // 如果你还没接上真正的 detector，就先清画布
+      ctx.clearRect(0, 0, cvs.width, cvs.height);
+      return;
     }
 
-    const lScore = scoreSide(lw)
-    const rScore = scoreSide(rw)
+    const person = engine.process({
+      persons: det,
+      ts: performance.now(),
+    });
 
-    if (lScore < 0 && rScore < 0) return null
-    return lScore >= rScore ? 'left' : 'right'
-  }
+    ctx.clearRect(0, 0, cvs.width, cvs.height);
 
-  /**
-   * 上肢点是否允许 —— 加了 primaryArm 的特判
-   */
-  function allowUpperPoint(
-    name: string,
-    pt: { x: number; y: number },
-    anchors: {
-      ls?: { x: number; y: number }
-      rs?: { x: number; y: number }
-      headY?: number
-      shoulderSpan?: number
-      centerX?: number
-      primary?: 'left' | 'right' | null
-    },
-  ): boolean {
-    const { ls, rs, headY, shoulderSpan, primary, centerX } = anchors
-    if (!ls || !rs || !shoulderSpan) return true
+    if (!person) return;
 
-    // 基础限制
-    const maxHorizontal = shoulderSpan * 0.5
-    const maxRadius = shoulderSpan * 1.85
+    const radius = 3; // 现在的一半
+    const minScore = 0.28;
 
-    // 这个点是某一侧的
-    const isLeft = name.startsWith('left_')
-    const isRight = name.startsWith('right_')
-    const thisShoulder = isLeft ? ls : isRight ? rs : null
+    // 先画点
+    for (const kp of person.keypoints) {
+      if (!kp) continue;
+      if ((kp.score ?? 0) < minScore) continue;
 
-    // 1) primary arm 可以高过头，也可以稍微再往中心伸
-    const isPrimaryPoint =
-      primary &&
-      ((primary === 'left' && isLeft) || (primary === 'right' && isRight)) &&
-      thisShoulder
-
-    if (isPrimaryPoint) {
-      // 放宽高度：不做头顶限制
-      // 放宽水平：左右各 0.65 span
-      const px = pt.x
-      const py = pt.y
-      const maxHori = shoulderSpan * 0.65
-      const dx = px - thisShoulder!.x
-      const dy = py - thisShoulder!.y
-      if (isLeft && px < thisShoulder!.x - maxHori) return false
-      if (isRight && px > thisShoulder!.x + maxHori) return false
-      const maxR = shoulderSpan * 2.6
-      if (Math.hypot(dx, dy) > maxR) return false
-      return true
-    }
-
-    // 2) 非 primary arm 走原来的“头顶+距离肩”限制
-    const topLimit = headY ? headY - shoulderSpan * 0.3 : undefined
-    if (topLimit !== undefined && pt.y < topLimit) return false
-
-    if (thisShoulder) {
-      const dx = pt.x - thisShoulder.x
-      const dy = pt.y - thisShoulder.y
-      if (isLeft && pt.x < thisShoulder.x - maxHorizontal) return false
-      if (isRight && pt.x > thisShoulder.x + maxHorizontal) return false
-      if (Math.hypot(dx, dy) > maxRadius) return false
-    }
-
-    // 中间的（鼻子这种）只要没超头顶就行
-    return true
-  }
-
-  const drawPose = (res: any) => {
-    const video = videoRef.current
-    const canvas = canvasRef.current
-    if (!video || !canvas || !res) return
-    const ctx = canvas.getContext('2d')
-    if (!ctx) return
-
-    const rect = video.getBoundingClientRect()
-    const displayW = rect.width
-    const displayH = rect.height
-    const rawW = video.videoWidth || displayW
-    const rawH = video.videoHeight || displayH
-
-    const dpr = typeof window !== 'undefined' ? window.devicePixelRatio || 1 : 1
-    canvas.width = displayW * dpr
-    canvas.height = displayH * dpr
-    canvas.style.width = displayW + 'px'
-    canvas.style.height = displayH + 'px'
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
-    ctx.clearRect(0, 0, displayW, displayH)
-
-    const scale = Math.min(displayW / rawW, displayH / rawH)
-    const drawW = rawW * scale
-    const drawH = rawH * scale
-    const offsetX = (displayW - drawW) / 2
-    const offsetY = (displayH - drawH) / 2
-
-    // 1. 原始点 → 画布坐标
-    const mp: Record<string, { x: number; y: number }> = {}
-    res.keypoints.forEach((k: any) => {
-      if (!k?.name) return
-      mp[k.name] = {
-        x: offsetX + k.x * scale,
-        y: offsetY + k.y * scale,
-      }
-    })
-
-    // 2. 手指、脚尖先补一遍
-    const ensureFinger = (wrist: string, elbow: string, out: string) => {
-      const w = mp[wrist]
-      const e = mp[elbow]
-      if (w && e && !mp[out]) {
-        const dx = w.x - e.x
-        const dy = w.y - e.y
-        mp[out] = { x: w.x + dx * 0.35, y: w.y + dy * 0.35 }
-      }
-    }
-    ensureFinger('left_wrist', 'left_elbow', 'left_finger_tip')
-    ensureFinger('right_wrist', 'right_elbow', 'right_finger_tip')
-
-    const ensureToe = (ankle: string, heel: string, out: string) => {
-      const a = mp[ankle]
-      const h = mp[heel]
-      if (mp[out]) return
-      if (a && h) {
-        const dx = a.x - h.x
-        const dy = a.y - h.y
-        mp[out] = { x: a.x + dx * 0.4, y: a.y + dy * 0.4 }
-      } else if (a) {
-        mp[out] = { x: a.x, y: a.y + drawH * 0.03 }
-      }
-    }
-    ensureToe('left_ankle', 'left_heel', 'left_foot_index')
-    ensureToe('right_ankle', 'right_heel', 'right_foot_index')
-
-    // 3. bbox 粗过滤（把背景人先搬走一部分）
-    const bbox = res.bbox as { x: number; y: number; w: number; h: number }
-    const boxX = offsetX + bbox.x * scale
-    const boxY = offsetY + bbox.y * scale
-    const boxW = bbox.w * scale
-    const boxH = bbox.h * scale
-    const padX = boxW * 0.25
-    const padY = boxH * 0.25
-
-    let filtered: Record<string, { x: number; y: number }> = {}
-    Object.entries(mp).forEach(([name, p]) => {
-      const inBox =
-        p.x >= boxX - padX &&
-        p.x <= boxX + boxW + padX &&
-        p.y >= boxY - padY &&
-        p.y <= boxY + boxH + padY
-      if (inBox) filtered[name] = p
-    })
-
-    // 4. 锚点 + primary arm
-    const ls = filtered['left_shoulder']
-    const rs = filtered['right_shoulder']
-    const nose = filtered['nose']
-    const le = filtered['left_eye']
-    const re = filtered['right_eye']
-
-    let headY: number | undefined = undefined
-    const headCand = [nose, le, re].filter(Boolean) as { y: number }[]
-    if (headCand.length) headY = Math.min(...headCand.map((p) => p.y))
-    const shoulderSpan = ls && rs ? Math.hypot(rs.x - ls.x, rs.y - ls.y) : undefined
-    const centerX = ls && rs ? (ls.x + rs.x) / 2 : undefined
-    const primary = detectPrimaryArm(filtered, { ls, rs })
-
-    const anchor = { ls, rs, headY, shoulderSpan, centerX, primary }
-
-    // 5. 上肢做 3rd-pass 过滤（含 primary 特判）
-    Object.entries(filtered).forEach(([name, p]) => {
-      if (pointGroup(name) !== 'upper') return
-      if (!allowUpperPoint(name, p, anchor)) {
-        delete filtered[name]
-      }
-    })
-
-    // 6. 保证 primary arm 这一侧的 3 个点都有：shoulder / elbow / wrist / finger
-    const last = lastDrawnRef.current
-    const ensurePrimaryChain = (side: 'left' | 'right') => {
-      const sName = side === 'left' ? 'left_shoulder' : 'right_shoulder'
-      const eName = side === 'left' ? 'left_elbow' : 'right_elbow'
-      const wName = side === 'left' ? 'left_wrist' : 'right_wrist'
-      const fName = side === 'left' ? 'left_finger_tip' : 'right_finger_tip'
-      const s = filtered[sName]
-      if (!s) return
-      const e = filtered[eName] ?? last[eName]
-      const w = filtered[wName] ?? last[wName]
-
-      // elbow 不在就用 shoulder → (shoulder → 另一侧肩) 的中点拉一小段出来
-      if (!filtered[eName]) {
-        if (e && allowUpperPoint(eName, e, anchor)) {
-          filtered[eName] = e
-        } else {
-          // 用肩往上长一点
-          const fake = { x: s.x, y: s.y - (shoulderSpan ?? 20) * 0.35 }
-          if (allowUpperPoint(eName, fake, anchor)) filtered[eName] = fake
-        }
+      // 按名字分颜色
+      let color = LOWER_COLOR;
+      if (
+        kp.name === 'left_shoulder' ||
+        kp.name === 'right_shoulder' ||
+        kp.name === 'left_hip' ||
+        kp.name === 'right_hip'
+      ) {
+        color = TORSO_COLOR;
+      } else if (
+        kp.name?.startsWith('left_knee') ||
+        kp.name?.startsWith('right_knee') ||
+        kp.name?.startsWith('left_ankle') ||
+        kp.name?.startsWith('right_ankle') ||
+        kp.name?.startsWith('left_foot') ||
+        kp.name?.startsWith('right_foot') ||
+        kp.name?.startsWith('left_heel') ||
+        kp.name?.startsWith('right_heel')
+      ) {
+        color = LOWER_COLOR;
+      } else {
+        // 头 + 上肢
+        color = UPPER_COLOR;
       }
 
-      const elbowNow = filtered[eName]
-      if (!filtered[wName] && elbowNow) {
-        if (w && allowUpperPoint(wName, w, anchor)) {
-          filtered[wName] = w
-        } else {
-          // 肘 → 手腕方向再拉一截
-          const fakeW = { x: elbowNow.x, y: elbowNow.y - (shoulderSpan ?? 20) * 0.55 }
-          if (allowUpperPoint(wName, fakeW, anchor)) filtered[wName] = fakeW
-        }
-      }
-
-      const wristNow = filtered[wName]
-      if (!filtered[fName] && wristNow && elbowNow) {
-        const dx = wristNow.x - elbowNow.x
-        const dy = wristNow.y - elbowNow.y
-        const fakeF = { x: wristNow.x + dx * 0.35, y: wristNow.y + dy * 0.35 }
-        if (allowUpperPoint(fName, fakeF, anchor)) filtered[fName] = fakeF
-      }
+      // 我们的坐标是绝对像素，不是 0~1
+      ctx.fillStyle = color;
+      ctx.beginPath();
+      ctx.arc(kp.x, kp.y, radius, 0, Math.PI * 2);
+      ctx.fill();
     }
 
-    if (primary) {
-      ensurePrimaryChain(primary)
-    } else {
-      // 如果没识别出 primary，就至少把两侧都补一下，保证不缺胳膊
-      ensurePrimaryChain('left')
-      ensurePrimaryChain('right')
+    // 再画线
+    for (const { pair, color } of ALL_CONNECTIONS) {
+      const [aName, bName] = pair;
+      const a = person.keypoints.find((k) => k.name === aName);
+      const b = person.keypoints.find((k) => k.name === bName);
+      if (!a || !b) continue;
+      if ((a.score ?? 0) < minScore || (b.score ?? 0) < minScore) continue;
+
+      // 避免又连到背景：线太长就不画
+      const dist = Math.hypot(a.x - b.x, a.y - b.y);
+      const maxLen = Math.min(cvs.width, cvs.height) * 0.6;
+      if (dist > maxLen) continue;
+
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(a.x, a.y);
+      ctx.lineTo(b.x, b.y);
+      ctx.stroke();
     }
+  }, []);
 
-    // 7. 回填上一帧里本应出现的关键点（同样要走 allowUpperPoint）
-    const EXPECTED = [
-      'nose',
-      'left_eye',
-      'right_eye',
-      'left_ear',
-      'right_ear',
-      'left_shoulder',
-      'right_shoulder',
-      'left_elbow',
-      'right_elbow',
-      'left_wrist',
-      'right_wrist',
-      'left_finger_tip',
-      'right_finger_tip',
-      'left_hip',
-      'right_hip',
-      'left_knee',
-      'right_knee',
-      'left_ankle',
-      'right_ankle',
-      'left_foot_index',
-      'right_foot_index',
-    ]
-    EXPECTED.forEach((name) => {
-      if (filtered[name]) return
-      const prev = last[name]
-      if (!prev) return
-      // 也要在 bbox 里
-      const inBox =
-        prev.x >= boxX - padX &&
-        prev.x <= boxX + boxW + padX &&
-        prev.y >= boxY - padY &&
-        prev.y <= boxY + boxH + padY
-      if (!inBox) return
-      if (pointGroup(name) === 'upper') {
-        if (!allowUpperPoint(name, prev, anchor)) return
-      }
-      filtered[name] = prev
-    })
-
-    // 8. 开始画线
-    const drawSeg = (pairs: [string, string][], color: string) => {
-      ctx.lineWidth = 2
-      ctx.strokeStyle = color
-      pairs.forEach(([a, b]) => {
-        const p1 = filtered[a]
-        const p2 = filtered[b]
-        if (!p1 || !p2) return
-        ctx.beginPath()
-        ctx.moveTo(p1.x, p1.y)
-        ctx.lineTo(p2.x, p2.y)
-        ctx.stroke()
-      })
-    }
-
-    drawSeg(SEG.torso, COLOR.torso)
-    drawSeg(SEG.lower, COLOR.lower)
-    drawSeg(SEG.upper, COLOR.upper)
-
-    // 9. 画点（你说一半大小，这里用 2px）
-    Object.entries(filtered).forEach(([name, p]) => {
-      const g = pointGroup(name)
-      ctx.beginPath()
-      ctx.fillStyle = COLOR[g]
-      ctx.arc(p.x, p.y, 2, 0, Math.PI * 2)
-      ctx.fill()
-      ctx.lineWidth = 1
-      ctx.strokeStyle = 'rgba(15,23,42,0.4)'
-      ctx.stroke()
-    })
-
-    // 10. 存这一帧
-    lastDrawnRef.current = filtered
-  }
-
-  const drawPoseAtTime = (t: number) => {
-    const list = samplesRef.current
-    if (!list.length) return
-    let best = list[0]
-    let diff = Math.abs(t - best.t)
-    for (let i = 1; i < list.length; i++) {
-      const d = Math.abs(t - list[i].t)
-      if (d < diff) {
-        diff = d
-        best = list[i]
-      }
-    }
-    drawPose(best.pose)
-  }
-
-  const handleAnalyze = async () => {
-    const video = videoRef.current
-    if (!video || !pose) return
-
-    video.pause()
-    video.currentTime = 0
-    await video.play()
-    setAnalyzing(true)
-
-    const samples: Sample[] = []
-    const maxDur = Math.min(video.duration || 4, 4)
-
-    while (!video.ended && video.currentTime <= maxDur) {
-      const t = video.currentTime
-      const res = await pose.estimate(video, t)
-      if (res) {
-        drawPose(res)
-        samples.push({ t, pose: res })
-      }
-      await new Promise((r) => setTimeout(r, 70))
-    }
-
-    video.pause()
-    video.currentTime = 0
-    samplesRef.current = samples
-
-    // ===== 打分保持你现在逻辑 =====
-    const last = samples.at(-1)
-    const kin = last ? computeAngles(last.pose) : {}
-    const rel = detectRelease(samples, coach)
-
-    const getKP = (name: string) => last?.pose.keypoints.find((k: any) => k.name === name)
-    const ensureAngle = (a: any, b: any, c: any) => {
-      const v1x = a.x - b.x
-      const v1y = a.y - b.y
-      const v2x = c.x - b.x
-      const v2y = c.y - b.y
-      const d1 = Math.hypot(v1x, v1y) || 1e-6
-      const d2 = Math.hypot(v2x, v2y) || 1e-6
-      const cos = (v1x * v2x + v1y * v2y) / (d1 * d2)
-      return (Math.acos(Math.max(-1, Math.min(1, cos))) * 180) / Math.PI
-    }
-
-    if (!kin.kneeL) {
-      const lh = getKP('left_hip')
-      const lk = getKP('left_knee')
-      const la = getKP('left_ankle')
-      if (lh && lk && la) kin.kneeL = ensureAngle(lh, lk, la)
-    }
-    if (!kin.kneeR) {
-      const rh = getKP('right_hip')
-      const rk = getKP('right_knee')
-      const ra = getKP('right_ankle')
-      if (rh && rk && ra) kin.kneeR = ensureAngle(rh, rk, ra)
-    }
-    if (!kin.releaseAngle) {
-      const rs = getKP('right_shoulder')
-      const re = getKP('right_elbow')
-      const rw = getKP('right_wrist')
-      if (rs && re && rw) {
-        kin.releaseAngle = ensureAngle(rs, re, rw)
-      } else if (re && rw) {
-        const dx = rw.x - re.x
-        const dy = rw.y - re.y
-        const forearmDeg = (Math.atan2(dy, dx) * 180) / Math.PI
-        kin.releaseAngle = Math.abs(90 - forearmDeg)
-      }
-    }
-
-    const features: any = {
-      kneeDepth: (() => {
-        const l = kin.kneeL
-        const r = kin.kneeR
-        if (typeof l === 'number' && typeof r === 'number') return Math.min(l, r)
-        if (typeof l === 'number') return l
-        if (typeof r === 'number') return r
-        return 110
-      })(),
-      extendSpeed: 260,
-      releaseAngle: kin.releaseAngle ?? 115,
-      wristFlex: kin.wristR ?? 35,
-      followThrough: 0.4,
-      elbowCurve: rel.elbowCurvePct ?? 0.018,
-      stability: rel.stabilityPct ?? 0.012,
-      alignment: rel.alignmentPct ?? 0.018,
-    }
-
-    let s = scoreAngles(features, coach)
-    s.buckets.forEach((b: any) => {
-      b.items.forEach((it: any) => {
-        if (!Number.isFinite(it.score) || it.score < UI_SOFT_FLOOR) it.score = UI_SOFT_FLOOR
-      })
-      b.score = Math.round(
-        b.items.reduce((sum: number, it: any) => sum + it.score, 0) / Math.max(1, b.items.length),
-      )
-    })
-    s.total = Math.round(
-      s.buckets.reduce((sum: number, b: any) => sum + b.score, 0) / Math.max(1, s.buckets.length),
-    )
-
-    setScore(s)
-    setAnalyzing(false)
-    drawPoseAtTime(0)
-  }
-
-  // 播放/seek 时同步姿态
+  // 播放时循环画
   useEffect(() => {
-    const video = videoRef.current
-    if (!video) return
-    const handle = () => {
-      if (!samplesRef.current.length) return
-      drawPoseAtTime(video.currentTime)
-    }
-    video.addEventListener('timeupdate', handle)
-    video.addEventListener('seeked', handle)
-    video.addEventListener('play', handle)
-    video.addEventListener('loadedmetadata', handle)
+    const vid = videoRef.current;
+    if (!vid) return;
+
+    const handlePlay = () => {
+      const loop = () => {
+        if (!videoRef.current) return;
+        if (!videoRef.current.paused && !videoRef.current.ended) {
+          drawPose();
+          requestAnimationFrame(loop);
+        }
+      };
+      loop();
+    };
+
+    const handleTime = () => {
+      drawPose();
+    };
+
+    vid.addEventListener('play', handlePlay);
+    vid.addEventListener('timeupdate', handleTime);
+    vid.addEventListener('seeked', handleTime);
+
     return () => {
-      video.removeEventListener('timeupdate', handle)
-      video.removeEventListener('seeked', handle)
-      video.removeEventListener('play', handle)
-      video.removeEventListener('loadedmetadata', handle)
-    }
-  }, [])
-
-  const suggestions: string[] = (() => {
-    if (!score) return []
-    const out: string[] = []
-    const upper = score.buckets.find((b: any) => b.name.includes('上肢'))
-    const balance = score.buckets.find((b: any) => b.name.includes('平衡') || b.name.includes('对齐'))
-    if (upper) {
-      const elbow = upper.items.find((x: any) => x.key === 'elbowCurve')
-      if (elbow && elbow.score < 70) out.push('肘部路径有横向漂移，出手时让肘尖朝向篮筐，手肘不要外展。')
-      const release = upper.items.find((x: any) => x.key === 'releaseAngle')
-      if (release && release.score < 70) out.push('出手角稍偏，出手时前臂再竖直一点。')
-    }
-    if (balance) {
-      const align = balance.items.find((x: any) => x.key === 'alignment')
-      if (align && align.score < 70) out.push('脚-髋-肩-腕没有完全对准篮筐，起手前把脚尖和肩都对准。')
-    }
-    if (!out.length) out.push('整体姿态不错，保持当前节奏，多录几段做基线。')
-    return out
-  })() // 注意这里要有括号闭合
+      vid.removeEventListener('play', handlePlay);
+      vid.removeEventListener('timeupdate', handleTime);
+      vid.removeEventListener('seeked', handleTime);
+    };
+  }, [drawPose]);
 
   return (
     <div className="space-y-4">
+      {/* 顶部标题 */}
       <div>
         <h1 className="text-2xl font-semibold text-slate-100">开始分析你的投篮</h1>
-        <p className="text-xs text-slate-400 mt-1">BUILD: coach-v3.9-release+wrist+color</p>
+        <p className="text-slate-400 text-sm mt-1">
+          BUILD: <span className="font-mono">coach-v3.9-release+wrist+color</span>
+        </p>
       </div>
 
-      <div className="flex flex-wrap gap-3 items-center">
-        <input
-          type="file"
-          accept="video/*"
-          onChange={handleFile}
-          className="shrink-0 bg-slate-100 text-slate-900 rounded px-3 py-2 text-sm"
-        />
+      {/* 上传 & 按钮 */}
+      <div className="flex items-center gap-4 flex-wrap">
+        <label className="flex items-center gap-2 bg-slate-900 border border-slate-700 px-4 py-2 rounded cursor-pointer text-slate-100">
+          选取文件
+          <input type="file" accept="video/*" className="hidden" onChange={handleFileChange} />
+          {file ? (
+            <span className="text-xs text-slate-300 max-w-[140px] truncate">
+              {file.name}
+            </span>
+          ) : null}
+        </label>
         <button
-          onClick={() => setOpenCfg(true)}
-          className="px-4 py-2 rounded bg-emerald-500 text-white text-sm font-medium"
+          onClick={() => setIsConfigOpen((p) => !p)}
+          className="px-6 py-2 rounded bg-emerald-500 text-white text-sm"
         >
           配置
         </button>
         <button
-          onClick={handleAnalyze}
-          disabled={!videoUrl || !pose || analyzing}
-          className="px-4 py-2 rounded bg-sky-500 text-white text-sm font-medium disabled:opacity-50"
+          onClick={handleStart}
+          disabled={!videoUrl}
+          className={`px-6 py-2 rounded text-sm ${
+            videoUrl ? 'bg-sky-500 text-white' : 'bg-slate-600 text-slate-300'
+          }`}
         >
-          {analyzing ? '识别中…' : '开始分析'}
+          {isAnalyzing ? '识别中…' : '开始分析'}
         </button>
       </div>
 
-      <div className="relative w-full max-w-3xl rounded-lg overflow-hidden border border-slate-800 bg-slate-900">
-        <video
-          ref={videoRef}
-          src={videoUrl ?? undefined}
-          className="w-full max-h-[360px] bg-black object-contain"
-          controls
-          playsInline
-          muted
-        />
-        <canvas ref={canvasRef} className="pointer-events-none absolute inset-0" />
+      {/* 视频 + 姿态覆盖层 */}
+      <div
+        className="relative bg-black rounded-lg overflow-hidden"
+        style={{
+          // 高度按视频比例来，没有就先给个 16:9
+          width: '100%',
+          maxWidth: '720px',
+          aspectRatio: videoSize.w && videoSize.h ? `${videoSize.w} / ${videoSize.h}` : '9 / 16',
+        }}
+      >
+        {videoUrl ? (
+          <>
+            <video
+              ref={videoRef}
+              src={videoUrl}
+              onLoadedMetadata={handleLoadedMetadata}
+              controls
+              className="w-full h-full object-contain bg-black"
+              playsInline
+            />
+            <canvas
+              ref={canvasRef}
+              className="pointer-events-none absolute inset-0 w-full h-full"
+            />
+          </>
+        ) : (
+          <div className="flex items-center justify-center h-64 text-slate-400 text-sm">
+            请先上传视频
+          </div>
+        )}
       </div>
 
-      {score && (
-        <>
-          <div className="text-lg font-semibold text-slate-100">总分：{score.total}</div>
-          <div className="grid gap-3 md:grid-cols-2">
-            {score.buckets.map((b: any) => (
-              <div key={b.name} className="rounded-lg bg-slate-800/40 border border-slate-700/50 p-3 space-y-2">
-                <div className="flex items-center justify-between">
-                  <div className="text-slate-100">{b.name}</div>
-                  <div className="text-cyan-300 text-xl font-bold">{b.score}</div>
-                </div>
-                <ul className="space-y-1 text-sm text-slate-200">
-                  {b.items.map((it: any) => {
-                    const unit = it.unit ? UNIT_CN[it.unit] ?? it.unit : ''
-                    const hasValue = typeof it.value === 'number' && Number.isFinite(it.value)
-                    const shown = hasValue
-                      ? it.unit === 'pct'
-                        ? (it.value * 100).toFixed(2) + '%'
-                        : it.value.toFixed(2) + unit
-                      : '未检测'
-                    return (
-                      <li key={it.key} className="flex items-center justify-between gap-2">
-                        <span>{it.label}</span>
-                        <span>
-                          {it.score}
-                          {` (${shown})`}
-                        </span>
-                      </li>
-                    )
-                  })}
-                </ul>
-              </div>
-            ))}
-          </div>
-          <div className="max-w-[380px]">
-            <RadarChart data={score.buckets.map((b: any) => ({ label: b.name, value: b.score }))} />
-          </div>
-          <div className="rounded-lg bg-slate-800/30 border border-slate-700/30 p-3 space-y-2">
-            <div className="text-slate-100 font-medium">投篮优化建议</div>
-            <ul className="list-disc pl-5 text-slate-200 text-sm space-y-1">
-              {suggestions.map((s) => (
-                <li key={s}>{s}</li>
-              ))}
-            </ul>
-          </div>
-        </>
-      )}
+      {/* 评分区域 */}
+      <div className="space-y-4">
+        <div className="text-slate-100 text-lg font-medium">总分：{scores.total}</div>
 
-      {openCfg && (
-        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50">
-          <div className="bg-slate-900 rounded-lg p-4 w-[min(90vw,720px)] max-h-[90vh] overflow-y-auto space-y-3">
-            <div className="flex justify-between items-center">
-              <div className="text-slate-100 font-semibold">打分配置</div>
-              <button onClick={() => setOpenCfg(false)} className="text-slate-400 hover:text-slate-100">
-                关闭
-              </button>
+        {/* 下肢 */}
+        <div className="bg-slate-900/60 rounded-lg p-4">
+          <div className="flex justify-between items-center">
+            <div className="text-slate-100 font-medium">下肢动力链</div>
+            <div className="text-cyan-300 text-xl font-semibold">{scores.lower.score}</div>
+          </div>
+          <div className="mt-2 space-y-1 text-sm text-slate-200">
+            <div className="flex justify-between">
+              <span>下蹲深度（膝角）</span>
+              <span>
+                {scores.lower.squat.score}{' '}
+                <span className="text-slate-400">({scores.lower.squat.value})</span>
+              </span>
             </div>
-            <ConfigPanel open={true} value={coach} onChange={setCoach} onClose={() => setOpenCfg(false)} />
+            <div className="flex justify-between">
+              <span>伸膝速度</span>
+              <span>
+                {scores.lower.kneeExt.score}{' '}
+                <span className="text-slate-400">({scores.lower.kneeExt.value})</span>
+              </span>
+            </div>
           </div>
         </div>
-      )}
+
+        {/* 上肢 */}
+        <div className="bg-slate-900/60 rounded-lg p-4">
+          <div className="flex justify-between items-center">
+            <div className="text-slate-100 font-medium">上肢出手</div>
+            <div className="text-cyan-300 text-xl font-semibold">{scores.upper.score}</div>
+          </div>
+          <div className="mt-2 space-y-1 text-sm text-slate-200">
+            <div className="flex justify-between">
+              <span>出手角</span>
+              <span>
+                {scores.upper.releaseAngle.score}{' '}
+                <span className="text-slate-400">({scores.upper.releaseAngle.value})</span>
+              </span>
+            </div>
+            <div className="flex justify-between">
+              <span>腕部发力</span>
+              <span>
+                {scores.upper.armPower.score}{' '}
+                <span className="text-slate-400">({scores.upper.armPower.value})</span>
+              </span>
+            </div>
+            <div className="flex justify-between">
+              <span>随挥保持</span>
+              <span>
+                {scores.upper.follow.score}{' '}
+                <span className="text-slate-400">({scores.upper.follow.value})</span>
+              </span>
+            </div>
+            <div className="flex justify-between">
+              <span>肘部路径紧凑</span>
+              <span>
+                {scores.upper.elbowTight.score}{' '}
+                <span className="text-slate-400">({scores.upper.elbowTight.value})</span>
+              </span>
+            </div>
+          </div>
+        </div>
+
+        {/* 对齐与平衡 */}
+        <div className="bg-slate-900/60 rounded-lg p-4">
+          <div className="flex justify-between items-center">
+            <div className="text-slate-100 font-medium">对齐与平衡</div>
+            <div className="text-cyan-300 text-xl font-semibold">{scores.balance.score}</div>
+          </div>
+          <div className="mt-2 space-y-1 text-sm text-slate-200">
+            <div className="flex justify-between">
+              <span>重心稳定（横摆）</span>
+              <span>
+                {scores.balance.center.score}{' '}
+                <span className="text-slate-400">({scores.balance.center.value})</span>
+              </span>
+            </div>
+            <div className="flex justify-between">
+              <span>对齐</span>
+              <span>
+                {scores.balance.align.score}{' '}
+                <span className="text-slate-400">({scores.balance.align.value})</span>
+              </span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* 配置弹层简单留一个占位 */}
+      {isConfigOpen ? (
+        <div className="bg-slate-900/80 rounded-lg p-4 border border-slate-700">
+          <div className="flex justify-between items-center mb-2">
+            <div className="text-slate-100 font-medium">配置</div>
+            <button
+              onClick={() => setIsConfigOpen(false)}
+              className="text-slate-300 hover:text-white text-sm"
+            >
+              关闭
+            </button>
+          </div>
+          <p className="text-slate-400 text-sm">
+            这里可以放「检测模型选择」「平滑强度」「评分阈值」等选项，先保留占位，保证和原项目布局一致。
+          </p>
+        </div>
+      ) : null}
     </div>
-  )
+  );
 }
