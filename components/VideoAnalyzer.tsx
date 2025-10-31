@@ -9,10 +9,13 @@ import { scoreAngles } from '@/lib/score/scorer'
 import { computeAngles } from '@/lib/analyze/kinematics'
 import { detectRelease, type Sample } from '@/lib/analyze/release'
 
+/**
+ * 颜色：上肢红、躯干蓝、下肢绿
+ */
 const COLOR = {
-  upper: 'rgba(248,113,113,1)', // 红：头+肩+上肢+手指
-  torso: 'rgba(59,130,246,0.95)', // 蓝：躯干
-  lower: 'rgba(34,197,94,0.95)', // 绿：下肢+脚尖
+  upper: 'rgba(248,113,113,1)',
+  torso: 'rgba(59,130,246,0.95)',
+  lower: 'rgba(34,197,94,0.95)',
 }
 
 const HEAD_KPS = ['nose', 'left_eye', 'right_eye', 'left_ear', 'right_ear'] as const
@@ -25,9 +28,11 @@ const SEG = {
     ['right_eye', 'right_ear'],
     ['nose', 'left_shoulder'],
     ['nose', 'right_shoulder'],
+
     ['left_shoulder', 'left_elbow'],
     ['left_elbow', 'left_wrist'],
     ['left_wrist', 'left_finger_tip'],
+
     ['right_shoulder', 'right_elbow'],
     ['right_elbow', 'right_wrist'],
     ['right_wrist', 'right_finger_tip'],
@@ -42,6 +47,7 @@ const SEG = {
     ['left_hip', 'left_knee'],
     ['left_knee', 'left_ankle'],
     ['left_ankle', 'left_foot_index'],
+
     ['right_hip', 'right_knee'],
     ['right_knee', 'right_ankle'],
     ['right_ankle', 'right_foot_index'],
@@ -84,7 +90,6 @@ export default function VideoAnalyzer() {
   const videoRef = useRef<HTMLVideoElement | null>(null)
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
   const samplesRef = useRef<Sample[]>([])
-  // 这里我们也要存“这一帧通过了所有过滤之后的点”，给下一帧做“安全回填”
   const lastDrawnRef = useRef<Record<string, { x: number; y: number }>>({})
 
   const [videoUrl, setVideoUrl] = useState<string | null>(null)
@@ -108,7 +113,42 @@ export default function VideoAnalyzer() {
     samplesRef.current = []
   }
 
-  // 判断当前帧的这个点能不能保留（给回填也用它）
+  /**
+   * 判断当前帧哪个是“投篮手”
+   * 策略：
+   * 1. 有肩 → 取两个肩的中点为 center
+   * 2. 看这一帧里左右手腕哪个“更靠近 center 且更高” → 这个就是 primary arm
+   */
+  function detectPrimaryArm(
+    pts: Record<string, { x: number; y: number }>,
+    anchor: { ls?: { x: number; y: number }; rs?: { x: number; y: number } },
+  ): 'left' | 'right' | null {
+    const { ls, rs } = anchor
+    if (!ls || !rs) return null
+    const centerX = (ls.x + rs.x) / 2
+    const lw = pts['left_wrist']
+    const rw = pts['right_wrist']
+    const span = Math.hypot(rs.x - ls.x, rs.y - ls.y) || 1
+
+    const scoreSide = (p?: { x: number; y: number }) => {
+      if (!p) return Number.NEGATIVE_INFINITY
+      // 越靠近中心 + 越高，得分越高
+      const distX = Math.abs(p.x - centerX)
+      const normX = 1 - Math.min(distX / (span * 0.8), 1)
+      const height = 1 - Math.min((p.y - Math.min(ls.y, rs.y)) / (span * 2.2), 1)
+      return normX * 0.6 + height * 0.4
+    }
+
+    const lScore = scoreSide(lw)
+    const rScore = scoreSide(rw)
+
+    if (lScore < 0 && rScore < 0) return null
+    return lScore >= rScore ? 'left' : 'right'
+  }
+
+  /**
+   * 上肢点是否允许 —— 加了 primaryArm 的特判
+   */
   function allowUpperPoint(
     name: string,
     pt: { x: number; y: number },
@@ -117,37 +157,56 @@ export default function VideoAnalyzer() {
       rs?: { x: number; y: number }
       headY?: number
       shoulderSpan?: number
+      centerX?: number
+      primary?: 'left' | 'right' | null
     },
   ): boolean {
-    const { ls, rs, headY, shoulderSpan } = anchors
+    const { ls, rs, headY, shoulderSpan, primary, centerX } = anchors
+    if (!ls || !rs || !shoulderSpan) return true
 
-    // 没有肩的信息，说明这帧识别不全，那就别太狠，先留着
-    if (!ls || !rs || !shoulderSpan || !headY) return true
+    // 基础限制
+    const maxHorizontal = shoulderSpan * 0.5
+    const maxRadius = shoulderSpan * 1.85
 
-    // 1) 不能比头顶高太多 —— 背景人的脸 / 手都比主角高
-    // 留 0.3 个肩宽的 buffer，免得你抬头看篮筐被砍
-    const topLimit = headY - shoulderSpan * 0.3
-    if (pt.y < topLimit) return false
+    // 这个点是某一侧的
+    const isLeft = name.startsWith('left_')
+    const isRight = name.startsWith('right_')
+    const thisShoulder = isLeft ? ls : isRight ? rs : null
 
-    // 2) 左右不要离自己这边的肩太远
-    const maxHorizontal = shoulderSpan * 0.5 // 比上一版再严一点
-    const maxRadius = shoulderSpan * 1.85   // 手完全伸出去也够用
+    // 1) primary arm 可以高过头，也可以稍微再往中心伸
+    const isPrimaryPoint =
+      primary &&
+      ((primary === 'left' && isLeft) || (primary === 'right' && isRight)) &&
+      thisShoulder
 
-    if (name.startsWith('left_')) {
-      const dx = pt.x - ls.x
-      const dy = pt.y - ls.y
-      if (pt.x < ls.x - maxHorizontal) return false
-      if (Math.hypot(dx, dy) > maxRadius) return false
-    } else if (name.startsWith('right_')) {
-      const dx = pt.x - rs.x
-      const dy = pt.y - rs.y
-      if (pt.x > rs.x + maxHorizontal) return false
-      if (Math.hypot(dx, dy) > maxRadius) return false
-    } else {
-      // 其它上肢点（鼻子之类）只做头顶限位就够了
-      if (pt.y < topLimit) return false
+    if (isPrimaryPoint) {
+      // 放宽高度：不做头顶限制
+      // 放宽水平：左右各 0.65 span
+      const px = pt.x
+      const py = pt.y
+      const maxHori = shoulderSpan * 0.65
+      const dx = px - thisShoulder!.x
+      const dy = py - thisShoulder!.y
+      if (isLeft && px < thisShoulder!.x - maxHori) return false
+      if (isRight && px > thisShoulder!.x + maxHori) return false
+      const maxR = shoulderSpan * 2.6
+      if (Math.hypot(dx, dy) > maxR) return false
+      return true
     }
 
+    // 2) 非 primary arm 走原来的“头顶+距离肩”限制
+    const topLimit = headY ? headY - shoulderSpan * 0.3 : undefined
+    if (topLimit !== undefined && pt.y < topLimit) return false
+
+    if (thisShoulder) {
+      const dx = pt.x - thisShoulder.x
+      const dy = pt.y - thisShoulder.y
+      if (isLeft && pt.x < thisShoulder.x - maxHorizontal) return false
+      if (isRight && pt.x > thisShoulder.x + maxHorizontal) return false
+      if (Math.hypot(dx, dy) > maxRadius) return false
+    }
+
+    // 中间的（鼻子这种）只要没超头顶就行
     return true
   }
 
@@ -172,14 +231,13 @@ export default function VideoAnalyzer() {
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
     ctx.clearRect(0, 0, displayW, displayH)
 
-    // 和 video object-contain 一样的比例
     const scale = Math.min(displayW / rawW, displayH / rawH)
     const drawW = rawW * scale
     const drawH = rawH * scale
     const offsetX = (displayW - drawW) / 2
     const offsetY = (displayH - drawH) / 2
 
-    // 1. 原始点 → 屏幕坐标
+    // 1. 原始点 → 画布坐标
     const mp: Record<string, { x: number; y: number }> = {}
     res.keypoints.forEach((k: any) => {
       if (!k?.name) return
@@ -189,7 +247,7 @@ export default function VideoAnalyzer() {
       }
     })
 
-    // 2. 一定要有的手指
+    // 2. 手指、脚尖先补一遍
     const ensureFinger = (wrist: string, elbow: string, out: string) => {
       const w = mp[wrist]
       const e = mp[elbow]
@@ -202,7 +260,6 @@ export default function VideoAnalyzer() {
     ensureFinger('left_wrist', 'left_elbow', 'left_finger_tip')
     ensureFinger('right_wrist', 'right_elbow', 'right_finger_tip')
 
-    // 3. 一定要有的脚尖
     const ensureToe = (ankle: string, heel: string, out: string) => {
       const a = mp[ankle]
       const h = mp[heel]
@@ -218,7 +275,7 @@ export default function VideoAnalyzer() {
     ensureToe('left_ankle', 'left_heel', 'left_foot_index')
     ensureToe('right_ankle', 'right_heel', 'right_foot_index')
 
-    // 4. 先按 bbox 过滤一遍 —— 这一步是“这个人”，不是背景
+    // 3. bbox 粗过滤（把背景人先搬走一部分）
     const bbox = res.bbox as { x: number; y: number; w: number; h: number }
     const boxX = offsetX + bbox.x * scale
     const boxY = offsetY + bbox.y * scale
@@ -237,22 +294,23 @@ export default function VideoAnalyzer() {
       if (inBox) filtered[name] = p
     })
 
-    // 5. 拿肩和头的信息，准备做“第三道防线”
+    // 4. 锚点 + primary arm
     const ls = filtered['left_shoulder']
     const rs = filtered['right_shoulder']
     const nose = filtered['nose']
     const le = filtered['left_eye']
     const re = filtered['right_eye']
-    const headY = Math.min(
-      ...( [nose, le, re].filter(Boolean) as { y: number }[] ).map((p) => p.y),
-      Number.POSITIVE_INFINITY,
-    )
-    const shoulderSpan =
-      ls && rs ? Math.hypot(rs.x - ls.x, rs.y - ls.y) : undefined
 
-    const anchor = { ls, rs, headY: Number.isFinite(headY) ? headY : undefined, shoulderSpan }
+    let headY: number | undefined = undefined
+    const headCand = [nose, le, re].filter(Boolean) as { y: number }[]
+    if (headCand.length) headY = Math.min(...headCand.map((p) => p.y))
+    const shoulderSpan = ls && rs ? Math.hypot(rs.x - ls.x, rs.y - ls.y) : undefined
+    const centerX = ls && rs ? (ls.x + rs.x) / 2 : undefined
+    const primary = detectPrimaryArm(filtered, { ls, rs })
 
-    // 6. 对“上肢相关的点”再来一层“头顶 + 距离肩”过滤
+    const anchor = { ls, rs, headY, shoulderSpan, centerX, primary }
+
+    // 5. 上肢做 3rd-pass 过滤（含 primary 特判）
     Object.entries(filtered).forEach(([name, p]) => {
       if (pointGroup(name) !== 'upper') return
       if (!allowUpperPoint(name, p, anchor)) {
@@ -260,7 +318,58 @@ export default function VideoAnalyzer() {
       }
     })
 
-    // 7. 回填上一帧：回填之前也要过 allowUpperPoint，不然背景点会回来
+    // 6. 保证 primary arm 这一侧的 3 个点都有：shoulder / elbow / wrist / finger
+    const last = lastDrawnRef.current
+    const ensurePrimaryChain = (side: 'left' | 'right') => {
+      const sName = side === 'left' ? 'left_shoulder' : 'right_shoulder'
+      const eName = side === 'left' ? 'left_elbow' : 'right_elbow'
+      const wName = side === 'left' ? 'left_wrist' : 'right_wrist'
+      const fName = side === 'left' ? 'left_finger_tip' : 'right_finger_tip'
+      const s = filtered[sName]
+      if (!s) return
+      const e = filtered[eName] ?? last[eName]
+      const w = filtered[wName] ?? last[wName]
+
+      // elbow 不在就用 shoulder → (shoulder → 另一侧肩) 的中点拉一小段出来
+      if (!filtered[eName]) {
+        if (e && allowUpperPoint(eName, e, anchor)) {
+          filtered[eName] = e
+        } else {
+          // 用肩往上长一点
+          const fake = { x: s.x, y: s.y - (shoulderSpan ?? 20) * 0.35 }
+          if (allowUpperPoint(eName, fake, anchor)) filtered[eName] = fake
+        }
+      }
+
+      const elbowNow = filtered[eName]
+      if (!filtered[wName] && elbowNow) {
+        if (w && allowUpperPoint(wName, w, anchor)) {
+          filtered[wName] = w
+        } else {
+          // 肘 → 手腕方向再拉一截
+          const fakeW = { x: elbowNow.x, y: elbowNow.y - (shoulderSpan ?? 20) * 0.55 }
+          if (allowUpperPoint(wName, fakeW, anchor)) filtered[wName] = fakeW
+        }
+      }
+
+      const wristNow = filtered[wName]
+      if (!filtered[fName] && wristNow && elbowNow) {
+        const dx = wristNow.x - elbowNow.x
+        const dy = wristNow.y - elbowNow.y
+        const fakeF = { x: wristNow.x + dx * 0.35, y: wristNow.y + dy * 0.35 }
+        if (allowUpperPoint(fName, fakeF, anchor)) filtered[fName] = fakeF
+      }
+    }
+
+    if (primary) {
+      ensurePrimaryChain(primary)
+    } else {
+      // 如果没识别出 primary，就至少把两侧都补一下，保证不缺胳膊
+      ensurePrimaryChain('left')
+      ensurePrimaryChain('right')
+    }
+
+    // 7. 回填上一帧里本应出现的关键点（同样要走 allowUpperPoint）
     const EXPECTED = [
       'nose',
       'left_eye',
@@ -284,25 +393,24 @@ export default function VideoAnalyzer() {
       'left_foot_index',
       'right_foot_index',
     ]
-    const last = lastDrawnRef.current
     EXPECTED.forEach((name) => {
       if (filtered[name]) return
       const prev = last[name]
       if (!prev) return
-      if (pointGroup(name) === 'upper') {
-        if (!allowUpperPoint(name, prev, anchor)) return
-      }
-      // 还是要在 bbox 里
+      // 也要在 bbox 里
       const inBox =
         prev.x >= boxX - padX &&
         prev.x <= boxX + boxW + padX &&
         prev.y >= boxY - padY &&
         prev.y <= boxY + boxH + padY
       if (!inBox) return
+      if (pointGroup(name) === 'upper') {
+        if (!allowUpperPoint(name, prev, anchor)) return
+      }
       filtered[name] = prev
     })
 
-    // 8. 画线
+    // 8. 开始画线
     const drawSeg = (pairs: [string, string][], color: string) => {
       ctx.lineWidth = 2
       ctx.strokeStyle = color
@@ -321,23 +429,22 @@ export default function VideoAnalyzer() {
     drawSeg(SEG.lower, COLOR.lower)
     drawSeg(SEG.upper, COLOR.upper)
 
-    // 9. 画点（半尺寸）
+    // 9. 画点（你说一半大小，这里用 2px）
     Object.entries(filtered).forEach(([name, p]) => {
       const g = pointGroup(name)
       ctx.beginPath()
       ctx.fillStyle = COLOR[g]
-      ctx.arc(p.x, p.y, 2.5, 0, Math.PI * 2)
+      ctx.arc(p.x, p.y, 2, 0, Math.PI * 2)
       ctx.fill()
       ctx.lineWidth = 1
-      ctx.strokeStyle = 'rgba(15,23,42,0.5)'
+      ctx.strokeStyle = 'rgba(15,23,42,0.4)'
       ctx.stroke()
     })
 
-    // 保存这一帧（是“安全过筛”之后的）
+    // 10. 存这一帧
     lastDrawnRef.current = filtered
   }
 
-  // 播放时画对应帧
   const drawPoseAtTime = (t: number) => {
     const list = samplesRef.current
     if (!list.length) return
@@ -353,7 +460,6 @@ export default function VideoAnalyzer() {
     drawPose(best.pose)
   }
 
-  // 点击开始分析
   const handleAnalyze = async () => {
     const video = videoRef.current
     if (!video || !pose) return
@@ -380,7 +486,7 @@ export default function VideoAnalyzer() {
     video.currentTime = 0
     samplesRef.current = samples
 
-    // ====== 打分逻辑保持不变 ======
+    // ===== 打分保持你现在逻辑 =====
     const last = samples.at(-1)
     const kin = last ? computeAngles(last.pose) : {}
     const rel = detectRelease(samples, coach)
@@ -459,7 +565,7 @@ export default function VideoAnalyzer() {
     drawPoseAtTime(0)
   }
 
-  // 播放/seek 同步姿态
+  // 播放/seek 时同步姿态
   useEffect(() => {
     const video = videoRef.current
     if (!video) return
@@ -496,7 +602,7 @@ export default function VideoAnalyzer() {
     }
     if (!out.length) out.push('整体姿态不错，保持当前节奏，多录几段做基线。')
     return out
-  })(); // 分号！
+  })() // 注意这里要有括号闭合
 
   return (
     <div className="space-y-4">
