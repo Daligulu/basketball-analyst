@@ -63,16 +63,28 @@ export default function VideoAnalyzer() {
   const [scores, setScores] = useState<AnalyzeScore>(INITIAL_SCORE);
   const [videoSize, setVideoSize] = useState<{ w: number; h: number }>({ w: 0, h: 0 });
 
+  // 初始化引擎
   useEffect(() => {
     engineRef.current = new PoseEngine({
+      modelPreference: 'blaze-full',
+      enableSmartCrop: false,
+      enableOpenCV: false,
       smooth: {
         minCutoff: 1.15,
         beta: 0.05,
         dCutoff: 1.0,
       },
+      thresholds: {
+        kneeMin: 45,
+        kneeMax: 165,
+        releaseAngleIdeal: 115,
+        lateralOffsetMaxPct: 0.09,
+      },
+      weights: [],
     } as any);
   }, []);
 
+  // 选择视频
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const f = e.target.files?.[0];
     if (!f) return;
@@ -83,6 +95,7 @@ export default function VideoAnalyzer() {
     setScores(INITIAL_SCORE);
   };
 
+  // 元数据加载 -> 同步 canvas 尺寸
   const handleLoadedMetadata = () => {
     const vid = videoRef.current;
     const cvs = canvasRef.current;
@@ -94,12 +107,14 @@ export default function VideoAnalyzer() {
     cvs.height = vh;
   };
 
+  // 点击开始分析
   const handleStart = async () => {
     if (!videoRef.current) return;
     videoRef.current.currentTime = 0;
     await videoRef.current.play();
     setIsAnalyzing(true);
 
+    // 先放一份示例分数
     setScores({
       total: 78,
       lower: {
@@ -122,6 +137,7 @@ export default function VideoAnalyzer() {
     });
   };
 
+  // 真正画姿态的函数
   const drawPose = useCallback(async () => {
     const vid = videoRef.current;
     const cvs = canvasRef.current;
@@ -135,6 +151,7 @@ export default function VideoAnalyzer() {
       return;
     }
 
+    // 这一步你在别的地方跑 TFJS 检测时，把结果挂到 window.__lastPoseFrame__ 就能被这里吃到
     const det: any = (window as any).__lastPoseFrame__;
     if (!det || !Array.isArray(det)) {
       ctx.clearRect(0, 0, cvs.width, cvs.height);
@@ -153,6 +170,7 @@ export default function VideoAnalyzer() {
     const radius = 3;
     const minScore = 0.28;
 
+    // 画点
     for (const kp of person.keypoints) {
       if (!kp) continue;
       if ((kp.score ?? 0) < minScore) continue;
@@ -186,6 +204,7 @@ export default function VideoAnalyzer() {
       ctx.fill();
     }
 
+    // 画线
     for (const { pair, color } of ALL_CONNECTIONS) {
       const [aName, bName] = pair;
       const a = person.keypoints.find((k) => k.name === aName);
@@ -206,6 +225,7 @@ export default function VideoAnalyzer() {
     }
   }, []);
 
+  // 播放/拖动时都画
   useEffect(() => {
     const vid = videoRef.current;
     if (!vid) return;
@@ -300,6 +320,7 @@ export default function VideoAnalyzer() {
         )}
       </div>
 
+      {/* 评分面板 */}
       <div className="space-y-4">
         <div className="text-slate-100 text-lg font-medium">总分：{scores.total}</div>
 
