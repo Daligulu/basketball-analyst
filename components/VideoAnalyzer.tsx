@@ -1,14 +1,13 @@
-// components/VideoAnalyzer.tsx
 'use client';
 
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { PoseEngine } from '@/lib/pose/poseEngine';
+import { PoseEngine } from '../lib/pose/poseEngine';
 import {
   ALL_CONNECTIONS,
   UPPER_COLOR,
   TORSO_COLOR,
   LOWER_COLOR,
-} from '@/lib/pose/skeleton';
+} from '../lib/pose/skeleton';
 
 type AnalyzeScore = {
   total: number;
@@ -64,10 +63,8 @@ export default function VideoAnalyzer() {
   const [scores, setScores] = useState<AnalyzeScore>(INITIAL_SCORE);
   const [videoSize, setVideoSize] = useState<{ w: number; h: number }>({ w: 0, h: 0 });
 
-  // 初始化姿态引擎
   useEffect(() => {
     engineRef.current = new PoseEngine({
-      // 这里可以根据需要传你原本 config.ts 里的参数
       smooth: {
         minCutoff: 1.15,
         beta: 0.05,
@@ -76,7 +73,6 @@ export default function VideoAnalyzer() {
     } as any);
   }, []);
 
-  // 选择文件
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const f = e.target.files?.[0];
     if (!f) return;
@@ -87,7 +83,6 @@ export default function VideoAnalyzer() {
     setScores(INITIAL_SCORE);
   };
 
-  // 视频元数据加载完以后，拿到真正的宽高，给 canvas 同步一下
   const handleLoadedMetadata = () => {
     const vid = videoRef.current;
     const cvs = canvasRef.current;
@@ -99,16 +94,12 @@ export default function VideoAnalyzer() {
     cvs.height = vh;
   };
 
-  // 点击“开始分析”
   const handleStart = async () => {
     if (!videoRef.current) return;
-    // 播放前把进度拉到 0，保持跟姿态同步
     videoRef.current.currentTime = 0;
     await videoRef.current.play();
     setIsAnalyzing(true);
 
-    // 这里你可以在将来塞你原项目的“真正分析”逻辑，把最后的得分 set 进来
-    // 现在先给一个固定的例子，避免面板是空的
     setScores({
       total: 78,
       lower: {
@@ -131,7 +122,6 @@ export default function VideoAnalyzer() {
     });
   };
 
-  // 姿态绘制函数：每一帧都调用
   const drawPose = useCallback(async () => {
     const vid = videoRef.current;
     const cvs = canvasRef.current;
@@ -140,13 +130,13 @@ export default function VideoAnalyzer() {
     const ctx = cvs.getContext('2d');
     if (!ctx) return;
 
-    // 这里跟我们刚才给你的 poseEngine 对上：它要吃的是“多人的一帧”，
-    // 但我们前端跑的是浏览器模型，所以简单地构造一个 fake 的帧：
-    // 注意：真正的项目里你可能已经有从 worker / detector 里出来的 pose 数组，
-    // 那里只要把数组塞进来就行
-    const det: any = (window as any).__lastPoseFrame__; // 如果你已经在别处跑模型，可以往 window 上挂
+    if (typeof window === 'undefined') {
+      ctx.clearRect(0, 0, cvs.width, cvs.height);
+      return;
+    }
+
+    const det: any = (window as any).__lastPoseFrame__;
     if (!det || !Array.isArray(det)) {
-      // 如果你还没接上真正的 detector，就先清画布
       ctx.clearRect(0, 0, cvs.width, cvs.height);
       return;
     }
@@ -160,15 +150,13 @@ export default function VideoAnalyzer() {
 
     if (!person) return;
 
-    const radius = 3; // 现在的一半
+    const radius = 3;
     const minScore = 0.28;
 
-    // 先画点
     for (const kp of person.keypoints) {
       if (!kp) continue;
       if ((kp.score ?? 0) < minScore) continue;
 
-      // 按名字分颜色
       let color = LOWER_COLOR;
       if (
         kp.name === 'left_shoulder' ||
@@ -189,18 +177,15 @@ export default function VideoAnalyzer() {
       ) {
         color = LOWER_COLOR;
       } else {
-        // 头 + 上肢
         color = UPPER_COLOR;
       }
 
-      // 我们的坐标是绝对像素，不是 0~1
       ctx.fillStyle = color;
       ctx.beginPath();
       ctx.arc(kp.x, kp.y, radius, 0, Math.PI * 2);
       ctx.fill();
     }
 
-    // 再画线
     for (const { pair, color } of ALL_CONNECTIONS) {
       const [aName, bName] = pair;
       const a = person.keypoints.find((k) => k.name === aName);
@@ -208,7 +193,6 @@ export default function VideoAnalyzer() {
       if (!a || !b) continue;
       if ((a.score ?? 0) < minScore || (b.score ?? 0) < minScore) continue;
 
-      // 避免又连到背景：线太长就不画
       const dist = Math.hypot(a.x - b.x, a.y - b.y);
       const maxLen = Math.min(cvs.width, cvs.height) * 0.6;
       if (dist > maxLen) continue;
@@ -222,15 +206,15 @@ export default function VideoAnalyzer() {
     }
   }, []);
 
-  // 播放时循环画
   useEffect(() => {
     const vid = videoRef.current;
     if (!vid) return;
 
     const handlePlay = () => {
       const loop = () => {
-        if (!videoRef.current) return;
-        if (!videoRef.current.paused && !videoRef.current.ended) {
+        const v = videoRef.current;
+        if (!v) return;
+        if (!v.paused && !v.ended) {
           drawPose();
           requestAnimationFrame(loop);
         }
@@ -255,7 +239,6 @@ export default function VideoAnalyzer() {
 
   return (
     <div className="space-y-4">
-      {/* 顶部标题 */}
       <div>
         <h1 className="text-2xl font-semibold text-slate-100">开始分析你的投篮</h1>
         <p className="text-slate-400 text-sm mt-1">
@@ -263,7 +246,6 @@ export default function VideoAnalyzer() {
         </p>
       </div>
 
-      {/* 上传 & 按钮 */}
       <div className="flex items-center gap-4 flex-wrap">
         <label className="flex items-center gap-2 bg-slate-900 border border-slate-700 px-4 py-2 rounded cursor-pointer text-slate-100">
           选取文件
@@ -291,11 +273,9 @@ export default function VideoAnalyzer() {
         </button>
       </div>
 
-      {/* 视频 + 姿态覆盖层 */}
       <div
         className="relative bg-black rounded-lg overflow-hidden"
         style={{
-          // 高度按视频比例来，没有就先给个 16:9
           width: '100%',
           maxWidth: '720px',
           aspectRatio: videoSize.w && videoSize.h ? `${videoSize.w} / ${videoSize.h}` : '9 / 16',
@@ -311,10 +291,7 @@ export default function VideoAnalyzer() {
               className="w-full h-full object-contain bg-black"
               playsInline
             />
-            <canvas
-              ref={canvasRef}
-              className="pointer-events-none absolute inset-0 w-full h-full"
-            />
+            <canvas ref={canvasRef} className="pointer-events-none absolute inset-0 w-full h-full" />
           </>
         ) : (
           <div className="flex items-center justify-center h-64 text-slate-400 text-sm">
@@ -323,11 +300,9 @@ export default function VideoAnalyzer() {
         )}
       </div>
 
-      {/* 评分区域 */}
       <div className="space-y-4">
         <div className="text-slate-100 text-lg font-medium">总分：{scores.total}</div>
 
-        {/* 下肢 */}
         <div className="bg-slate-900/60 rounded-lg p-4">
           <div className="flex justify-between items-center">
             <div className="text-slate-100 font-medium">下肢动力链</div>
@@ -351,7 +326,6 @@ export default function VideoAnalyzer() {
           </div>
         </div>
 
-        {/* 上肢 */}
         <div className="bg-slate-900/60 rounded-lg p-4">
           <div className="flex justify-between items-center">
             <div className="text-slate-100 font-medium">上肢出手</div>
@@ -389,7 +363,6 @@ export default function VideoAnalyzer() {
           </div>
         </div>
 
-        {/* 对齐与平衡 */}
         <div className="bg-slate-900/60 rounded-lg p-4">
           <div className="flex justify-between items-center">
             <div className="text-slate-100 font-medium">对齐与平衡</div>
@@ -414,7 +387,6 @@ export default function VideoAnalyzer() {
         </div>
       </div>
 
-      {/* 配置弹层简单留一个占位 */}
       {isConfigOpen ? (
         <div className="bg-slate-900/80 rounded-lg p-4 border border-slate-700">
           <div className="flex justify-between items-center mb-2">
