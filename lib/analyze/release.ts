@@ -1,13 +1,11 @@
 // lib/analyze/release.ts
-import type { CoachConfig } from '@/config/coach'
+import type { CoachConfig } from '../../config/coach'
+import type { PoseResult } from '../pose/poseEngine'
 
-export type Sample = {
-  t: number // 秒
-  pose: any
-}
+export type Sample = { t: number; pose: PoseResult }
 
-function kp(pose: any, name: string) {
-  return pose?.keypoints?.find((k: any) => k.name === name)
+function kp(p: PoseResult, name: string) {
+  return p.keypoints.find((k) => k.name === name)
 }
 
 function variance(xs: number[]): number {
@@ -17,6 +15,7 @@ function variance(xs: number[]): number {
   return v
 }
 
+// 这里返回我们前面评分要的三个量：肘部路径紧凑 / 稳定性 / 对齐
 export function detectRelease(samples: Sample[], cfg: CoachConfig) {
   const minElbow = cfg.releaseDetect?.minElbowDeg ?? 150
   const bodyScale = cfg.releaseDetect?.bodyWidthScale ?? 3
@@ -42,15 +41,12 @@ export function detectRelease(samples: Sample[], cfg: CoachConfig) {
   const bases = [...hipXs, ...feetXs]
   const baseSpan = bases.length > 1 ? Math.max(...bases) - Math.min(...bases) : 1
 
-  // 肘部路径紧凑 = 肘的横向跨度 / (身体宽度 * 系数)
   const elbowSpan = elbowXs.length > 1 ? Math.max(...elbowXs) - Math.min(...elbowXs) : 0
   const elbowCurvePct = elbowSpan / (baseSpan * bodyScale)
 
-  // 重心稳定：用髋的方差粗略表示
   const hipVar = variance(hipXs)
   const stabilityPct = baseSpan > 0 ? Math.min(1, hipVar / baseSpan) : 0
 
-  // 对齐：最后一帧髋中点和脚中点的差
   let alignmentPct = 0
   const last = samples.at(-1)
   if (last) {
