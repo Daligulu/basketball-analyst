@@ -1,14 +1,16 @@
+// components/VideoAnalyzer.tsx
 'use client';
 
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { PoseEngine } from '../lib/pose/poseEngine';
+import { PoseEngine, type PoseResult } from '@/lib/pose/poseEngine';
 import {
   ALL_CONNECTIONS,
   UPPER_COLOR,
   TORSO_COLOR,
   LOWER_COLOR,
-} from '../lib/pose/skeleton';
+} from '@/lib/pose/skeleton';
 
+// ---- 分数类型 ----
 type AnalyzeScore = {
   total: number;
   lower: {
@@ -57,7 +59,7 @@ export default function VideoAnalyzer() {
   const engineRef = useRef<PoseEngine | null>(null);
 
   const [file, setFile] = useState<File | null>(null);
-  const [videoUrl, setVideoUrl] = useState<string>('');
+  const [videoUrl, setVideoUrl] = useState('');
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [isConfigOpen, setIsConfigOpen] = useState(false);
   const [scores, setScores] = useState<AnalyzeScore>(INITIAL_SCORE);
@@ -66,36 +68,26 @@ export default function VideoAnalyzer() {
   // 初始化引擎
   useEffect(() => {
     engineRef.current = new PoseEngine({
-      modelPreference: 'blaze-full',
-      enableSmartCrop: false,
-      enableOpenCV: false,
       smooth: {
         minCutoff: 1.15,
         beta: 0.05,
         dCutoff: 1.0,
       },
-      thresholds: {
-        kneeMin: 45,
-        kneeMax: 165,
-        releaseAngleIdeal: 115,
-        lateralOffsetMaxPct: 0.09,
-      },
-      weights: [],
-    } as any);
+    });
   }, []);
 
-  // 选择视频
+  // 上传视频
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const f = e.target.files?.[0];
     if (!f) return;
     setFile(f);
     const url = URL.createObjectURL(f);
     setVideoUrl(url);
-    setIsAnalyzing(false);
     setScores(INITIAL_SCORE);
+    setIsAnalyzing(false);
   };
 
-  // 元数据加载 -> 同步 canvas 尺寸
+  // 视频元数据
   const handleLoadedMetadata = () => {
     const vid = videoRef.current;
     const cvs = canvasRef.current;
@@ -107,14 +99,14 @@ export default function VideoAnalyzer() {
     cvs.height = vh;
   };
 
-  // 点击开始分析
+  // 开始分析
   const handleStart = async () => {
     if (!videoRef.current) return;
     videoRef.current.currentTime = 0;
     await videoRef.current.play();
     setIsAnalyzing(true);
 
-    // 先放一份示例分数
+    // 这里先用一个固定的演示分数，避免下面的面板是空的
     setScores({
       total: 78,
       lower: {
@@ -135,10 +127,13 @@ export default function VideoAnalyzer() {
         align: { score: 83, value: '2.00%' },
       },
     });
+
+    // ⚠️ 关键：这里立刻复位按钮，不然你线上看到的一直是“识别中…”
+    setIsAnalyzing(false);
   };
 
-  // 真正画姿态的函数
-  const drawPose = useCallback(async () => {
+  // 画姿态
+  const drawPose = useCallback(() => {
     const vid = videoRef.current;
     const cvs = canvasRef.current;
     const engine = engineRef.current;
@@ -146,29 +141,29 @@ export default function VideoAnalyzer() {
     const ctx = cvs.getContext('2d');
     if (!ctx) return;
 
-    if (typeof window === 'undefined') {
-      ctx.clearRect(0, 0, cvs.width, cvs.height);
-      return;
+    // 前端真正的检测你还没接上，这里先从 window 兜底拿一下
+    let persons: any[] = [];
+    if (typeof window !== 'undefined') {
+      const raw = (window as any).__lastPoseFrame__;
+      if (Array.isArray(raw)) {
+        persons = raw;
+      }
     }
 
-    // 这一步你在别的地方跑 TFJS 检测时，把结果挂到 window.__lastPoseFrame__ 就能被这里吃到
-    const det: any = (window as any).__lastPoseFrame__;
-    if (!det || !Array.isArray(det)) {
-      ctx.clearRect(0, 0, cvs.width, cvs.height);
-      return;
-    }
-
-    const person = engine.process({
-      persons: det,
+    const frame = {
+      persons,
       ts: performance.now(),
-    });
+    };
 
+    const person: PoseResult = engine.process(frame);
     ctx.clearRect(0, 0, cvs.width, cvs.height);
 
-    if (!person) return;
+    if (!person) {
+      return;
+    }
 
-    const radius = 3;
     const minScore = 0.28;
+    const radius = 3;
 
     // 画点
     for (const kp of person.keypoints) {
@@ -184,14 +179,10 @@ export default function VideoAnalyzer() {
       ) {
         color = TORSO_COLOR;
       } else if (
-        kp.name?.startsWith('left_knee') ||
-        kp.name?.startsWith('right_knee') ||
-        kp.name?.startsWith('left_ankle') ||
-        kp.name?.startsWith('right_ankle') ||
-        kp.name?.startsWith('left_foot') ||
-        kp.name?.startsWith('right_foot') ||
-        kp.name?.startsWith('left_heel') ||
-        kp.name?.startsWith('right_heel')
+        kp.name?.includes('knee') ||
+        kp.name?.includes('ankle') ||
+        kp.name?.includes('foot') ||
+        kp.name?.includes('heel')
       ) {
         color = LOWER_COLOR;
       } else {
@@ -225,16 +216,15 @@ export default function VideoAnalyzer() {
     }
   }, []);
 
-  // 播放/拖动时都画
+  // 跟视频播放绑定
   useEffect(() => {
     const vid = videoRef.current;
     if (!vid) return;
 
     const handlePlay = () => {
       const loop = () => {
-        const v = videoRef.current;
-        if (!v) return;
-        if (!v.paused && !v.ended) {
+        if (!videoRef.current) return;
+        if (!videoRef.current.paused && !videoRef.current.ended) {
           drawPose();
           requestAnimationFrame(loop);
         }
@@ -257,8 +247,67 @@ export default function VideoAnalyzer() {
     };
   }, [drawPose]);
 
+  // 一个简单的雷达图（SVG），不额外引第三方
+  const Radar = ({ score }: { score: AnalyzeScore }) => {
+    // 按你原页面的三大块来：下肢、上肢、对齐
+    const vals = [
+      score.lower.score || 0,
+      score.upper.score || 0,
+      score.balance.score || 0,
+    ];
+    const max = 100;
+    const points = vals
+      .map((v, i) => {
+        const ang = (-Math.PI / 2) + (i * (2 * Math.PI)) / 3;
+        const r = 70 * (v / max);
+        const cx = 90 + r * Math.cos(ang);
+        const cy = 90 + r * Math.sin(ang);
+        return `${cx},${cy}`;
+      })
+      .join(' ');
+
+    return (
+      <svg width={180} height={180} className="mx-auto">
+        {/* 三个轴 */}
+        <line x1="90" y1="90" x2="90" y2="20" stroke="#334155" />
+        <line x1="90" y1="90" x2="20" y2="140" stroke="#334155" />
+        <line x1="90" y1="90" x2="160" y2="140" stroke="#334155" />
+        {/* 面 */}
+        <polygon points={points} fill="rgba(56,189,248,0.3)" stroke="#38bdf8" strokeWidth={2} />
+        <text x="88" y="14" fontSize="10" fill="#cbd5f5">
+          下肢
+        </text>
+        <text x="0" y="154" fontSize="10" fill="#cbd5f5">
+          对齐
+        </text>
+        <text x="145" y="154" fontSize="10" fill="#cbd5f5">
+          上肢
+        </text>
+      </svg>
+    );
+  };
+
+  // 简单的建议
+  const renderSuggestion = (s: AnalyzeScore) => {
+    const list: string[] = [];
+    if (s.lower.squat.score < 60) {
+      list.push('下蹲略浅，起跳前再多沉一点蹲深度（膝角 < 160°）。');
+    }
+    if (s.upper.releaseAngle.score < 60) {
+      list.push('出手角度偏低，出手时肘部再高一点。');
+    }
+    if (s.balance.center.score < 70) {
+      list.push('重心左右有摆动，注意起跳时膝盖保持在脚尖上方。');
+    }
+    if (!list.length) {
+      list.push('动作整体不错，保持节奏即可。');
+    }
+    return list;
+  };
+
   return (
     <div className="space-y-4">
+      {/* 顶部标题 */}
       <div>
         <h1 className="text-2xl font-semibold text-slate-100">开始分析你的投篮</h1>
         <p className="text-slate-400 text-sm mt-1">
@@ -266,6 +315,7 @@ export default function VideoAnalyzer() {
         </p>
       </div>
 
+      {/* 上传 + 按钮 */}
       <div className="flex items-center gap-4 flex-wrap">
         <label className="flex items-center gap-2 bg-slate-900 border border-slate-700 px-4 py-2 rounded cursor-pointer text-slate-100">
           选取文件
@@ -293,6 +343,7 @@ export default function VideoAnalyzer() {
         </button>
       </div>
 
+      {/* 视频 + overlay */}
       <div
         className="relative bg-black rounded-lg overflow-hidden"
         style={{
@@ -311,7 +362,10 @@ export default function VideoAnalyzer() {
               className="w-full h-full object-contain bg-black"
               playsInline
             />
-            <canvas ref={canvasRef} className="pointer-events-none absolute inset-0 w-full h-full" />
+            <canvas
+              ref={canvasRef}
+              className="pointer-events-none absolute inset-0 w-full h-full"
+            />
           </>
         ) : (
           <div className="flex items-center justify-center h-64 text-slate-400 text-sm">
@@ -320,10 +374,11 @@ export default function VideoAnalyzer() {
         )}
       </div>
 
-      {/* 评分面板 */}
+      {/* 分数 */}
       <div className="space-y-4">
         <div className="text-slate-100 text-lg font-medium">总分：{scores.total}</div>
 
+        {/* 下肢 */}
         <div className="bg-slate-900/60 rounded-lg p-4">
           <div className="flex justify-between items-center">
             <div className="text-slate-100 font-medium">下肢动力链</div>
@@ -347,6 +402,7 @@ export default function VideoAnalyzer() {
           </div>
         </div>
 
+        {/* 上肢 */}
         <div className="bg-slate-900/60 rounded-lg p-4">
           <div className="flex justify-between items-center">
             <div className="text-slate-100 font-medium">上肢出手</div>
@@ -384,6 +440,7 @@ export default function VideoAnalyzer() {
           </div>
         </div>
 
+        {/* 对齐与平衡 */}
         <div className="bg-slate-900/60 rounded-lg p-4">
           <div className="flex justify-between items-center">
             <div className="text-slate-100 font-medium">对齐与平衡</div>
@@ -406,8 +463,21 @@ export default function VideoAnalyzer() {
             </div>
           </div>
         </div>
+
+        {/* 雷达图 + 建议 */}
+        <div className="bg-slate-900/40 rounded-lg p-4 space-y-3">
+          <div className="text-slate-100 font-medium mb-1">投篮姿态雷达图</div>
+          <Radar score={scores} />
+          <div className="text-slate-100 font-medium mt-3">投篮优化建议</div>
+          <ul className="list-disc list-inside space-y-1 text-sm text-slate-200">
+            {renderSuggestion(scores).map((t, idx) => (
+              <li key={idx}>{t}</li>
+            ))}
+          </ul>
+        </div>
       </div>
 
+      {/* 配置弹层 */}
       {isConfigOpen ? (
         <div className="bg-slate-900/80 rounded-lg p-4 border border-slate-700">
           <div className="flex justify-between items-center mb-2">
@@ -420,7 +490,7 @@ export default function VideoAnalyzer() {
             </button>
           </div>
           <p className="text-slate-400 text-sm">
-            这里可以放「检测模型选择」「平滑强度」「评分阈值」等选项，先保留占位，保证和原项目布局一致。
+            这里可以放“检测模型选择”“平滑强度”“评分阈值”等选项，占个位，保持布局一致。
           </p>
         </div>
       ) : null}
