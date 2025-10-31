@@ -21,7 +21,7 @@ export interface PoseFrame {
   ts: number; // ms
 }
 
-// 头部相关点：避免头后面乱拉线
+// 头部相关点：用来做“头后面乱连”裁剪
 const HEAD_LIKE = new Set([
   'nose',
   'left_eye',
@@ -32,7 +32,7 @@ const HEAD_LIKE = new Set([
   'mouth_right',
 ]);
 
-// 比较稳的身体大点：用来算中心、锁住投篮人
+// 较稳定的身体点：用来算人体中心，锁定真正要画的那个人
 const BODY_LIKE = new Set([
   'left_shoulder',
   'right_shoulder',
@@ -58,7 +58,6 @@ export class PoseEngine {
   private lastCenter: { x: number; y: number } | null = null;
 
   constructor(cfg: CoachConfig) {
-    // 保持和原配置兼容，多的就塞进去
     this.cfg = {
       ...cfg,
       smooth: cfg.smooth ?? DEFAULT_SMOOTH,
@@ -67,7 +66,7 @@ export class PoseEngine {
   }
 
   /**
-   * 主入口：传一帧“可能有多个人”的检测结果进来，返回一个清洗后的、只针对投篮人的 Pose
+   * 传入一帧（可能多人）的检测结果，返回一个清洗后的“当前这个要跟踪的人”
    */
   process(frame: PoseFrame): PosePerson | null {
     const { persons, ts } = frame;
@@ -86,9 +85,9 @@ export class PoseEngine {
     };
   }
 
-  // ============== 内部逻辑 ==============
+  // ========== 内部工具 ==========
 
-  // 从多个人里选中真正要画的那个人
+  // 从多个人里挑真正要画的那一个（靠中 + 靠上一帧 + 检测分高）
   private pickMainPerson(persons: PosePerson[]): PosePerson | null {
     if (persons.length === 1) {
       const only = persons[0];
@@ -103,7 +102,7 @@ export class PoseEngine {
       const center = this.personCenter(p.keypoints);
       if (!center) continue;
 
-      const distToMid = Math.hypot(center.x - 0.5, center.y - 0.5); // 越靠中心越好
+      const distToMid = Math.hypot(center.x - 0.5, center.y - 0.5);
       const distToLast =
         this.lastCenter != null
           ? Math.hypot(center.x - this.lastCenter.x, center.y - this.lastCenter.y)
@@ -111,11 +110,8 @@ export class PoseEngine {
 
       const avg = this.avgScore(p.keypoints);
 
-      // 权重稍微偏向上一帧锁定的那个人，防止跳到背景
-      const score =
-        avg -
-        distToMid * 0.35 -
-        distToLast * 0.28; // 可再调
+      // 稍微偏好上一帧 + 居中
+      const score = avg - distToMid * 0.35 - distToLast * 0.28;
 
       if (score > bestScore) {
         bestScore = score;
@@ -127,18 +123,16 @@ export class PoseEngine {
     return best;
   }
 
-  // 把没有 name 的点按顺序补 name，方便前端用名字找点
+  // 给没名字的关键点补名字
   private normalizeKeypoints(kps: PoseKeypoint[]): PoseKeypoint[] {
-    if (kps.every((k) => !!k.name)) {
-      return kps;
-    }
+    if (kps.every((k) => !!k.name)) return kps;
     return kps.map((k, i) => ({
       ...k,
       name: k.name ?? PRIMARY_KEYPOINT_ORDER[i] ?? `kp_${i}`,
     }));
   }
 
-  // 每个点一条 OneEuro2D，时间用秒
+  // 帧间平滑
   private smoothKeypoints(kps: PoseKeypoint[], ts: number): PoseKeypoint[] {
     const t = ts / 1000;
     return kps.map((kp) => {
@@ -161,23 +155,23 @@ export class PoseEngine {
     return f;
   }
 
-  // 把“头后面飞出去的点”收回来
+  // 修头部飞点
   private fixHeadSpikes(kps: PoseKeypoint[]): PoseKeypoint[] {
     const headPts = kps.filter((k) => HEAD_LIKE.has(k.name));
-    if (headPts.length === 0) return kps;
+    if (!headPts.length) return kps;
 
     const cx = headPts.reduce((s, k) => s + k.x, 0) / headPts.length;
     const cy = headPts.reduce((s, k) => s + k.y, 0) / headPts.length;
 
-    const MAX_R = 0.08; // 头的半径上限（相对 0~1）
+    const MAX_HEAD_R = 0.08;
 
     return kps.map((k) => {
       if (!HEAD_LIKE.has(k.name)) return k;
       const dx = k.x - cx;
       const dy = k.y - cy;
-      const d = Math.hypot(dx, dy);
-      if (d <= MAX_R) return k;
-      const ratio = MAX_R / d;
+      const dist = Math.hypot(dx, dy);
+      if (dist <= MAX_HEAD_R) return k;
+      const ratio = MAX_HEAD_R / dist;
       return {
         ...k,
         x: cx + dx * ratio,
@@ -206,3 +200,6 @@ export class PoseEngine {
     return c ? s / c : 0;
   }
 }
+
+// ✅ 给老代码用的类型出口，修复 vercel 报错
+export type PoseResult = PosePerson | null;
