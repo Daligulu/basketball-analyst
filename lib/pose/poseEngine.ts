@@ -59,7 +59,6 @@ export class PoseEngine {
       return
     }
 
-    // BlazePose：本地优先，失败自动回退 CDN（和你原项目一样）
     const type = pref === 'blaze-full' ? 'full' : 'lite'
     const local = '/mediapipe/pose'
     const localOk = await headOk(`${local}/pose_solution_packed_assets.data`)
@@ -72,7 +71,6 @@ export class PoseEngine {
         { runtime: 'mediapipe', modelType: type, solutionPath } as any,
       )
     } catch {
-      // 二次回退：lite + CDN
       this.detector = await poseDetection.createDetector(
         poseDetection.SupportedModels.BlazePose,
         { runtime: 'mediapipe', modelType: 'lite', solutionPath: cdn } as any,
@@ -107,7 +105,7 @@ export class PoseEngine {
     return names[i] || ''
   }
 
-  // 👉 这里是这次的关键：tSec 可选 + smooth 有兜底
+  // 统一入口：tSec 可选；smooth 有兜底
   async estimate(
     video: HTMLVideoElement | HTMLCanvasElement,
     tSec?: number,
@@ -128,17 +126,28 @@ export class PoseEngine {
       name: k.name || this.kpName(i),
     }))
 
-    const smCfg = this.cfg.smooth ?? { minCutoff: 1, beta: 0.02, dCutoff: 1 }
+    // 👉 这里是关键：就算 cfg.smooth 没传，也自己造一个
+    const smCfg = this.cfg.smooth ?? {
+      minCutoff: 1,
+      beta: 0.02,
+      dCutoff: 1,
+    }
 
     const out: Keypoint[] = kps.map((k) => {
       const id = k.name || 'kp'
-      const s =
+      // 👉 OneEuro2D 要的是一个对象，不是三个参数
+      const smoother =
         this.smoothers[id] ||
-        (this.smoothers[id] = new OneEuro2D(smCfg.minCutoff, smCfg.beta, smCfg.dCutoff))
-      const f = s.next(k.x, k.y, nowSec)
-      return { ...k, x: f.x, y: f.y }
+        (this.smoothers[id] = new OneEuro2D({
+          minCutoff: smCfg.minCutoff,
+          beta: smCfg.beta,
+          dCutoff: smCfg.dCutoff,
+        }))
+      const filtered = smoother.next(k.x, k.y, nowSec)
+      return { ...k, x: filtered.x, y: filtered.y }
     })
 
+    // 可选智能裁剪
     if (this.cfg.enableSmartCrop) {
       const xs = out.map((k) => k.x)
       const ys = out.map((k) => k.y)
