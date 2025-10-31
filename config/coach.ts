@@ -25,13 +25,31 @@ export type ReleaseDetectConfig = {
   bodyWidthScale?: number
 }
 
+export type SmoothConfig = {
+  enabled?: boolean
+  freq?: number
+  minCutoff?: number
+  beta?: number
+  dCutoff?: number
+}
+
 export type CoachConfig = {
+  // 👉 给 lib/pose/poseEngine.ts 用的
+  smooth?: SmoothConfig
+  // 👉 给 lib/analyze/release.ts 用的
   releaseDetect?: ReleaseDetectConfig
+  // 👉 打分权重
   weights: WeightBucket[]
 }
 
 export const DEFAULT_CONFIG: CoachConfig = {
-  // 给 release.ts 用的配置
+  smooth: {
+    enabled: true,
+    freq: 30,
+    minCutoff: 1,
+    beta: 0.02,
+    dCutoff: 1,
+  },
   releaseDetect: {
     minElbowDeg: 150,
     bodyWidthScale: 3,
@@ -108,7 +126,7 @@ export const DEFAULT_CONFIG: CoachConfig = {
           weight: 0.2,
           rule: {
             target: 0,
-            tolerance: 0.3, // 稍微放宽，别老 0 分
+            tolerance: 0.3, // 放宽，别老 0 分
             unit: 'pct',
             better: '<=|',
           },
