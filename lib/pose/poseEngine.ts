@@ -19,18 +19,21 @@ async function headOk(url: string) {
 }
 
 /**
- * 从模型返回的多个人里挑“最像是投篮的人”
- * 规则（从强到弱）：
- * 1. 脚越接近画面底部越好（前景人）
- * 2. 框越大越好（但不过分）
- * 3. 越靠中间越好
- * 4. 关键点平均分越高越好
+ * 选“真正要画的那个投篮人”
+ * 优先级：
+ * 1. 框的中心在画面中间（0.32~0.68 之间）
+ * 2. 脚在下面
+ * 3. 框不要太小
+ * 4. 关键点均值高
  */
 function pickPrimaryPose(poses: any[], videoW: number, videoH: number): any | null {
   if (!poses || !poses.length) return null
   if (poses.length === 1) return poses[0]
 
-  const imgCenterX = videoW / 2
+  const screenCenterX = videoW / 2
+  const centerL = videoW * 0.32
+  const centerR = videoW * 0.68
+
   let best: any = null
   let bestScore = -Infinity
 
@@ -38,38 +41,35 @@ function pickPrimaryPose(poses: any[], videoW: number, videoH: number): any | nu
     const ks = (p.keypoints || []).filter((k: any) => k.score == null || k.score > 0.15)
     if (!ks.length) continue
 
-    // 基础框
     const xs = ks.map((k: any) => k.x)
     const ys = ks.map((k: any) => k.y)
+
     const minX = Math.min(...xs)
     const maxX = Math.max(...xs)
     const minY = Math.min(...ys)
     const maxY = Math.max(...ys)
+
     const bboxW = maxX - minX
     const bboxH = maxY - minY
     const area = bboxW * bboxH
 
-    // 最低的点（越靠下越像前景）
-    const lowestY = maxY // y 越大越靠下
-
-    // 在画面里的水平中心
     const centerX = (minX + maxX) / 2
-    const centerDist = Math.abs(centerX - imgCenterX) // 越小越好
+    const centerDist = Math.abs(centerX - screenCenterX)
 
-    // 平均置信度
+    const lowestY = maxY
+
     const avgScore =
-      ks.reduce((sum: number, k: any) => sum + (k.score ?? 0.5), 0) / Math.max(1, ks.length)
+      ks.reduce((s: number, k: any) => s + (k.score ?? 0.5), 0) / Math.max(1, ks.length)
 
-    // 分数：把“脚在下面”权重拉高，把“在中间”也拉高
+    const inCenter = centerX >= centerL && centerX <= centerR
+
+    // 打分：中心奖励拉得很高，防止左边那个背景人
     const score =
-      // 脚越靠下面越好
-      lowestY * 1.7 +
-      // 框越大越好
-      area * 0.35 +
-      // 越在中间越好
-      -centerDist * 0.6 +
-      // 置信度加一点
-      avgScore * 1200
+      lowestY * 1.6 + // 脚越靠下越好
+      area * 0.3 + // 框越大越好
+      -centerDist * 2.0 + // 离中越近越好
+      avgScore * 1000 + // 关键点越靠谱越好
+      (inCenter ? 2500 : 0) // 在中间直接给巨额奖励
 
     if (score > bestScore) {
       bestScore = score
@@ -142,8 +142,7 @@ export class PoseEngine {
   }
 
   private kpName(i: number) {
-    // 保持你项目里这套 keypoint 命名，末尾是脚尖
-    const names = [
+    return [
       'nose',
       'left_eye',
       'right_eye',
@@ -165,8 +164,7 @@ export class PoseEngine {
       'right_heel',
       'left_foot_index',
       'right_foot_index',
-    ]
-    return names[i] || ''
+    ][i] || ''
   }
 
   async estimate(
@@ -179,7 +177,6 @@ export class PoseEngine {
     const videoW = (video as any).videoWidth || (video as any).width || 720
     const videoH = (video as any).videoHeight || (video as any).height || 1280
 
-    // ⭐ 一次取多个人
     const poses = await this.detector.estimatePoses(video as any, {
       maxPoses: 4,
       flipHorizontal: false,
@@ -189,19 +186,14 @@ export class PoseEngine {
     if (!primary) return null
 
     const nowSec = typeof tSec === 'number' ? tSec : performance.now() / 1000
+    const smCfg = this.cfg.smooth ?? { minCutoff: 1, beta: 0.02, dCutoff: 1 }
 
-    const smCfg = this.cfg.smooth ?? {
-      minCutoff: 1,
-      beta: 0.02,
-      dCutoff: 1,
-    }
-
-    const kps: Keypoint[] = (primary.keypoints as any).map((k: any, i: number) => {
+    const keypoints: Keypoint[] = (primary.keypoints as any).map((k: any, i: number) => {
       const name = k.name || this.kpName(i)
-      const id = name || 'kp'
+      const smootherId = name || `kp-${i}`
       const smoother =
-        this.smoothers[id] ||
-        (this.smoothers[id] = new OneEuro2D({
+        this.smoothers[smootherId] ||
+        (this.smoothers[smootherId] = new OneEuro2D({
           minCutoff: smCfg.minCutoff,
           beta: smCfg.beta,
           dCutoff: smCfg.dCutoff,
@@ -214,18 +206,12 @@ export class PoseEngine {
             ? (smoother as any).filter(k.x, k.y, nowSec)
             : { x: k.x, y: k.y }
 
-      return {
-        x: filtered.x,
-        y: filtered.y,
-        score: k.score,
-        name,
-      }
+      return { x: filtered.x, y: filtered.y, score: k.score, name }
     })
 
-    // 可选裁剪
     if (this.cfg.enableSmartCrop) {
-      const xs = kps.map((k) => k.x)
-      const ys = kps.map((k) => k.y)
+      const xs = keypoints.map((k) => k.x)
+      const ys = keypoints.map((k) => k.y)
       const minx = Math.min(...xs)
       const maxx = Math.max(...xs)
       const miny = Math.min(...ys)
@@ -237,7 +223,7 @@ export class PoseEngine {
     }
 
     return {
-      keypoints: kps,
+      keypoints,
       bbox: this.bbox || { x: 0, y: 0, w: videoW, h: videoH },
     }
   }
