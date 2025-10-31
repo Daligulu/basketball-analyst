@@ -1,16 +1,12 @@
 // lib/pose/poseEngine.ts
 // 一个极简的前端姿态后处理器，把多人的一帧 -> 单人、并做一下平滑
 
-// ---- 基础类型 ----
 export type Keypoint2D = {
   name: string;
   x: number;
   y: number;
   score?: number;
 };
-
-// 给老代码用的别名：老的分析代码想要的是 PoseKeypoint
-export type PoseKeypoint = Keypoint2D;
 
 export type Person2D = {
   keypoints: Keypoint2D[];
@@ -23,7 +19,6 @@ export type MultiPersonFrame = {
   ts: number; // ms
 };
 
-// 给分析模块用的类型
 export type PoseResult = Person2D | null;
 
 export type SmoothConfig = {
@@ -63,7 +58,7 @@ class OneEuro2D {
       return { x, y };
     }
 
-    // 简化的一阶低通
+    // 简化版：不做速度滤波，直接一阶低通
     const alpha = this.alpha(dt, this.minCutoff);
     const nx = prev.x + alpha * (x - prev.x);
     const ny = prev.y + alpha * (y - prev.y);
@@ -71,10 +66,13 @@ class OneEuro2D {
     return { x: nx, y: ny };
   }
 
-  smooth(kps: Keypoint2D[], ts: number): Keypoint2D[] {
+  smooth(
+    kps: Keypoint2D[],
+    ts: number
+  ): Keypoint2D[] {
     if (this.prevTime == null) {
       this.prevTime = ts;
-      // 第一次直接记下来
+      // 第一次不动
       for (const kp of kps) {
         this.prev[kp.name] = { x: kp.x, y: kp.y };
       }
@@ -82,7 +80,6 @@ class OneEuro2D {
     }
     const dt = Math.max((ts - this.prevTime) / 1000, 1e-3);
     this.prevTime = ts;
-
     return kps.map((kp) => {
       const sm = this.filterPoint(kp.name, kp.x, kp.y, dt);
       return { ...kp, x: sm.x, y: sm.y };
@@ -113,7 +110,7 @@ export class PoseEngine {
     const persons = frame?.persons ?? [];
     if (!persons.length) return null;
 
-    // 1. 选出“看起来离镜头最近/面积最大”的那个
+    // 1. 先选一个最像“前景人物”的
     const best = persons
       .map((p) => {
         const box = p.box;
@@ -123,7 +120,6 @@ export class PoseEngine {
       .sort((a, b) => b.area - a.area)[0].person;
 
     let kps = best.keypoints ?? [];
-
     // 2. 做平滑
     if (this.filter) {
       kps = this.filter.smooth(kps, frame.ts);
