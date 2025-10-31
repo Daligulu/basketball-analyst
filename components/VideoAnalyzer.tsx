@@ -9,42 +9,34 @@ import { scoreAngles } from '@/lib/score/scorer'
 import { computeAngles } from '@/lib/analyze/kinematics'
 import { detectRelease, type Sample } from '@/lib/analyze/release'
 
-// 颜色定义
 const COLOR = {
-  upper: 'rgba(248,113,113,1)', // 红
-  torso: 'rgba(59,130,246,0.95)', // 蓝
-  lower: 'rgba(34,197,94,0.95)', // 绿
+  upper: 'rgba(248,113,113,1)',
+  torso: 'rgba(59,130,246,0.95)',
+  lower: 'rgba(34,197,94,0.95)',
 }
 
-// 头部关键点
 const HEAD_KPS = ['nose', 'left_eye', 'right_eye', 'left_ear', 'right_ear'] as const
 
-// 参考原图的连线
+// 线的分组
 const SEG = {
-  // 头 + 肩 + 手臂 全红
   upper: [
-    // 头部细线
     ['nose', 'left_eye'],
     ['nose', 'right_eye'],
     ['left_eye', 'left_ear'],
     ['right_eye', 'right_ear'],
-    // 头到肩
     ['nose', 'left_shoulder'],
     ['nose', 'right_shoulder'],
-    // 肩 → 肘 → 腕
     ['left_shoulder', 'left_elbow'],
     ['left_elbow', 'left_wrist'],
     ['right_shoulder', 'right_elbow'],
     ['right_elbow', 'right_wrist'],
   ] as [string, string][],
-  // 躯干蓝
   torso: [
     ['left_shoulder', 'right_shoulder'],
     ['left_shoulder', 'left_hip'],
     ['right_shoulder', 'right_hip'],
     ['left_hip', 'right_hip'],
   ] as [string, string][],
-  // 下肢绿
   lower: [
     ['left_hip', 'left_knee'],
     ['left_knee', 'left_ankle'],
@@ -87,8 +79,6 @@ const UNIT_CN: Record<string, string> = { deg: '度', s: '秒', pct: '%' }
 export default function VideoAnalyzer() {
   const videoRef = useRef<HTMLVideoElement | null>(null)
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
-
-  // 用来存识别出来的所有帧
   const samplesRef = useRef<Sample[]>([])
 
   const [videoUrl, setVideoUrl] = useState<string | null>(null)
@@ -98,7 +88,6 @@ export default function VideoAnalyzer() {
   const [openCfg, setOpenCfg] = useState(false)
   const [analyzing, setAnalyzing] = useState(false)
 
-  // 初始化引擎
   useEffect(() => {
     const p = new PoseEngine(coach)
     setPose(p)
@@ -113,7 +102,7 @@ export default function VideoAnalyzer() {
     samplesRef.current = []
   }
 
-  // 画一帧姿态
+  // 画一帧
   const drawPose = (res: any) => {
     const video = videoRef.current
     const canvas = canvasRef.current
@@ -135,14 +124,13 @@ export default function VideoAnalyzer() {
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
     ctx.clearRect(0, 0, displayW, displayH)
 
-    // 跟 object-contain 一致的缩放
     const scale = Math.min(displayW / rawW, displayH / rawH)
     const drawW = rawW * scale
     const drawH = rawH * scale
     const offsetX = (displayW - drawW) / 2
     const offsetY = (displayH - drawH) / 2
 
-    // 建索引
+    // keypoint 映射
     const mp: Record<string, { x: number; y: number }> = {}
     res.keypoints.forEach((k: any) => {
       if (!k?.name) return
@@ -152,8 +140,40 @@ export default function VideoAnalyzer() {
       }
     })
 
+    // 👉 合成“手指”——如果没给，就从手腕往手肘方向延长一点
+    function makeFinger(wristName: string, elbowName: string, outName: string) {
+      const w = mp[wristName]
+      const e = mp[elbowName]
+      if (w && e) {
+        const dx = w.x - e.x
+        const dy = w.y - e.y
+        mp[outName] = {
+          x: w.x + dx * 0.35,
+          y: w.y + dy * 0.35,
+        }
+      }
+    }
+    makeFinger('left_wrist', 'left_elbow', 'left_finger_tip')
+    makeFinger('right_wrist', 'right_elbow', 'right_finger_tip')
+
+    // 👉 脚尖如果模型没给，就用脚踝→鞋跟去推一点
+    function makeToe(ankleName: string, heelName: string, outName: string) {
+      const a = mp[ankleName]
+      const h = mp[heelName]
+      if (a && h && !mp[outName]) {
+        const dx = a.x - h.x
+        const dy = a.y - h.y
+        mp[outName] = {
+          x: a.x + dx * 0.4,
+          y: a.y + dy * 0.4,
+        }
+      }
+    }
+    makeToe('left_ankle', 'left_heel', 'left_foot_index')
+    makeToe('right_ankle', 'right_heel', 'right_foot_index')
+
     const drawSeg = (pairs: [string, string][], color: string) => {
-      ctx.lineWidth = 4
+      ctx.lineWidth = 2 // 一半
       ctx.strokeStyle = color
       pairs.forEach(([a, b]) => {
         const p1 = mp[a]
@@ -166,28 +186,29 @@ export default function VideoAnalyzer() {
       })
     }
 
-    // 躯干 → 腿 → 上肢，避免上肢遮住躯干
+    // 画线
     drawSeg(SEG.torso, COLOR.torso)
     drawSeg(SEG.lower, COLOR.lower)
     drawSeg(SEG.upper, COLOR.upper)
 
-    // 点
-    res.keypoints.forEach((k: any) => {
-      if (!k?.name) return
-      const group = pointGroup(k.name)
-      const x = offsetX + k.x * scale
-      const y = offsetY + k.y * scale
+    // 画点
+    const drawPoint = (name: string, x: number, y: number) => {
+      const group = pointGroup(name)
       ctx.beginPath()
       ctx.fillStyle = COLOR[group]
-      ctx.arc(x, y, 5, 0, Math.PI * 2)
+      ctx.arc(x, y, 2.5, 0, Math.PI * 2) // 半径减半
       ctx.fill()
-      ctx.lineWidth = 1.5
-      ctx.strokeStyle = 'rgba(15,23,42,0.6)'
+      ctx.lineWidth = 1
+      ctx.strokeStyle = 'rgba(15,23,42,0.5)'
       ctx.stroke()
+    }
+
+    Object.entries(mp).forEach(([name, p]) => {
+      drawPoint(name, p.x, p.y)
     })
   }
 
-  // 根据视频时间画最近的一帧
+  // 根据时间画最近一帧
   const drawPoseAtTime = (t: number) => {
     const list = samplesRef.current
     if (!list.length) return
@@ -207,11 +228,9 @@ export default function VideoAnalyzer() {
   const handleAnalyze = async () => {
     const video = videoRef.current
     if (!video || !pose) return
-
     try {
       await video.play()
     } catch {}
-
     setAnalyzing(true)
     const samples: Sample[] = []
     const start = performance.now()
@@ -227,10 +246,9 @@ export default function VideoAnalyzer() {
       await new Promise((r) => setTimeout(r, 90))
     }
 
-    // 存起来，后面回放也能画
     samplesRef.current = samples
 
-    // 评分
+    // 评分和之前一样
     const last = samples.at(-1)
     const kin = last ? computeAngles(last.pose) : {}
     const rel = detectRelease(samples, coach)
@@ -308,7 +326,7 @@ export default function VideoAnalyzer() {
     setAnalyzing(false)
   }
 
-  // 识别后回放时始终画姿态
+  // 回放时也画
   useEffect(() => {
     const video = videoRef.current
     if (!video) return
@@ -328,7 +346,6 @@ export default function VideoAnalyzer() {
     }
   }, [])
 
-  // 建议
   const suggestions: string[] = (() => {
     if (!score) return []
     const out: string[] = []
@@ -336,25 +353,17 @@ export default function VideoAnalyzer() {
     const balance = score.buckets.find((b: any) => b.name.includes('平衡') || b.name.includes('对齐'))
     if (upper) {
       const elbow = upper.items.find((x: any) => x.key === 'elbowCurve')
-      if (elbow && elbow.score < 70) {
-        out.push('肘部路径有横向漂移，出手时让肘尖朝向篮筐，手肘不要外展。')
-      }
+      if (elbow && elbow.score < 70) out.push('肘部路径有横向漂移，出手时让肘尖朝向篮筐，手肘不要外展。')
       const release = upper.items.find((x: any) => x.key === 'releaseAngle')
-      if (release && release.score < 70) {
-        out.push('出手角稍偏，出手时前臂再竖直一点。')
-      }
+      if (release && release.score < 70) out.push('出手角稍偏，出手时前臂再竖直一点。')
     }
     if (balance) {
       const align = balance.items.find((x: any) => x.key === 'alignment')
-      if (align && align.score < 70) {
-        out.push('脚-髋-肩-腕没有完全对准篮筐，起手前把脚尖和肩都对准。')
-      }
+      if (align && align.score < 70) out.push('脚-髋-肩-腕没有完全对准篮筐，起手前把脚尖和肩都对准。')
     }
-    if (!out.length) {
-      out.push('整体姿态不错，保持当前节奏，多录几段做基线。')
-    }
+    if (!out.length) out.push('整体姿态不错，保持当前节奏，多录几段做基线。')
     return out
-  })(); // 👈 这里一定要有分号！！！
+  })()
 
   return (
     <div className="space-y-4">
@@ -385,7 +394,6 @@ export default function VideoAnalyzer() {
         </button>
       </div>
 
-      {/* 播放区 */}
       <div className="relative w-full max-w-3xl rounded-lg overflow-hidden border border-slate-800 bg-slate-900">
         <video
           ref={videoRef}
@@ -398,7 +406,6 @@ export default function VideoAnalyzer() {
         <canvas ref={canvasRef} className="pointer-events-none absolute inset-0" />
       </div>
 
-      {/* 评分面板 */}
       {score && (
         <>
           <div className="text-lg font-semibold text-slate-100">总分：{score.total}</div>
@@ -432,11 +439,9 @@ export default function VideoAnalyzer() {
               </div>
             ))}
           </div>
-
           <div className="max-w-[380px]">
             <RadarChart data={score.buckets.map((b: any) => ({ label: b.name, value: b.score }))} />
           </div>
-
           <div className="rounded-lg bg-slate-800/30 border border-slate-700/30 p-3 space-y-2">
             <div className="text-slate-100 font-medium">投篮优化建议</div>
             <ul className="list-disc pl-5 text-slate-200 text-sm space-y-1">
@@ -448,7 +453,6 @@ export default function VideoAnalyzer() {
         </>
       )}
 
-      {/* 配置面板 */}
       {openCfg && (
         <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50">
           <div className="bg-slate-900 rounded-lg p-4 w-[min(90vw,720px)] max-h-[90vh] overflow-y-auto space-y-3">
