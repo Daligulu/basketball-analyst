@@ -84,7 +84,7 @@ export default function VideoAnalyzer() {
   const videoRef = useRef<HTMLVideoElement | null>(null)
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
   const samplesRef = useRef<Sample[]>([])
-  // 用来回填上一帧
+  // 这里我们也要存“这一帧通过了所有过滤之后的点”，给下一帧做“安全回填”
   const lastDrawnRef = useRef<Record<string, { x: number; y: number }>>({})
 
   const [videoUrl, setVideoUrl] = useState<string | null>(null)
@@ -108,7 +108,49 @@ export default function VideoAnalyzer() {
     samplesRef.current = []
   }
 
-  // 画一帧
+  // 判断当前帧的这个点能不能保留（给回填也用它）
+  function allowUpperPoint(
+    name: string,
+    pt: { x: number; y: number },
+    anchors: {
+      ls?: { x: number; y: number }
+      rs?: { x: number; y: number }
+      headY?: number
+      shoulderSpan?: number
+    },
+  ): boolean {
+    const { ls, rs, headY, shoulderSpan } = anchors
+
+    // 没有肩的信息，说明这帧识别不全，那就别太狠，先留着
+    if (!ls || !rs || !shoulderSpan || !headY) return true
+
+    // 1) 不能比头顶高太多 —— 背景人的脸 / 手都比主角高
+    // 留 0.3 个肩宽的 buffer，免得你抬头看篮筐被砍
+    const topLimit = headY - shoulderSpan * 0.3
+    if (pt.y < topLimit) return false
+
+    // 2) 左右不要离自己这边的肩太远
+    const maxHorizontal = shoulderSpan * 0.5 // 比上一版再严一点
+    const maxRadius = shoulderSpan * 1.85   // 手完全伸出去也够用
+
+    if (name.startsWith('left_')) {
+      const dx = pt.x - ls.x
+      const dy = pt.y - ls.y
+      if (pt.x < ls.x - maxHorizontal) return false
+      if (Math.hypot(dx, dy) > maxRadius) return false
+    } else if (name.startsWith('right_')) {
+      const dx = pt.x - rs.x
+      const dy = pt.y - rs.y
+      if (pt.x > rs.x + maxHorizontal) return false
+      if (Math.hypot(dx, dy) > maxRadius) return false
+    } else {
+      // 其它上肢点（鼻子之类）只做头顶限位就够了
+      if (pt.y < topLimit) return false
+    }
+
+    return true
+  }
+
   const drawPose = (res: any) => {
     const video = videoRef.current
     const canvas = canvasRef.current
@@ -130,14 +172,14 @@ export default function VideoAnalyzer() {
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
     ctx.clearRect(0, 0, displayW, displayH)
 
-    // 跟 <video object-contain> 一样的缩放
+    // 和 video object-contain 一样的比例
     const scale = Math.min(displayW / rawW, displayH / rawH)
     const drawW = rawW * scale
     const drawH = rawH * scale
     const offsetX = (displayW - drawW) / 2
     const offsetY = (displayH - drawH) / 2
 
-    // 1. 全部点 -> 屏幕坐标
+    // 1. 原始点 → 屏幕坐标
     const mp: Record<string, { x: number; y: number }> = {}
     res.keypoints.forEach((k: any) => {
       if (!k?.name) return
@@ -147,8 +189,8 @@ export default function VideoAnalyzer() {
       }
     })
 
-    // 2. 补手指
-    const mkFinger = (wrist: string, elbow: string, out: string) => {
+    // 2. 一定要有的手指
+    const ensureFinger = (wrist: string, elbow: string, out: string) => {
       const w = mp[wrist]
       const e = mp[elbow]
       if (w && e && !mp[out]) {
@@ -157,11 +199,11 @@ export default function VideoAnalyzer() {
         mp[out] = { x: w.x + dx * 0.35, y: w.y + dy * 0.35 }
       }
     }
-    mkFinger('left_wrist', 'left_elbow', 'left_finger_tip')
-    mkFinger('right_wrist', 'right_elbow', 'right_finger_tip')
+    ensureFinger('left_wrist', 'left_elbow', 'left_finger_tip')
+    ensureFinger('right_wrist', 'right_elbow', 'right_finger_tip')
 
-    // 3. 补脚尖
-    const mkToe = (ankle: string, heel: string, out: string) => {
+    // 3. 一定要有的脚尖
+    const ensureToe = (ankle: string, heel: string, out: string) => {
       const a = mp[ankle]
       const h = mp[heel]
       if (mp[out]) return
@@ -173,10 +215,10 @@ export default function VideoAnalyzer() {
         mp[out] = { x: a.x, y: a.y + drawH * 0.03 }
       }
     }
-    mkToe('left_ankle', 'left_heel', 'left_foot_index')
-    mkToe('right_ankle', 'right_heel', 'right_foot_index')
+    ensureToe('left_ankle', 'left_heel', 'left_foot_index')
+    ensureToe('right_ankle', 'right_heel', 'right_foot_index')
 
-    // 4. 先用 bbox 过滤一次（这是“属于这个人”的大范围）
+    // 4. 先按 bbox 过滤一遍 —— 这一步是“这个人”，不是背景
     const bbox = res.bbox as { x: number; y: number; w: number; h: number }
     const boxX = offsetX + bbox.x * scale
     const boxY = offsetY + bbox.y * scale
@@ -185,48 +227,40 @@ export default function VideoAnalyzer() {
     const padX = boxW * 0.25
     const padY = boxH * 0.25
 
-    let filteredMp: Record<string, { x: number; y: number }> = {}
+    let filtered: Record<string, { x: number; y: number }> = {}
     Object.entries(mp).forEach(([name, p]) => {
       const inBox =
         p.x >= boxX - padX &&
         p.x <= boxX + boxW + padX &&
         p.y >= boxY - padY &&
         p.y <= boxY + boxH + padY
-      if (inBox) filteredMp[name] = p
+      if (inBox) filtered[name] = p
     })
 
-    // 5. ⭐ 再用“肩宽范围”专门收紧【上肢】防止连到背景人
-    const ls = filteredMp['left_shoulder']
-    const rs = filteredMp['right_shoulder']
-    if (ls && rs) {
-      const shoulderSpan = Math.hypot(rs.x - ls.x, rs.y - ls.y) || 40
-      const leftMinX = ls.x - shoulderSpan * 0.45
-      const rightMaxX = rs.x + shoulderSpan * 0.45
+    // 5. 拿肩和头的信息，准备做“第三道防线”
+    const ls = filtered['left_shoulder']
+    const rs = filtered['right_shoulder']
+    const nose = filtered['nose']
+    const le = filtered['left_eye']
+    const re = filtered['right_eye']
+    const headY = Math.min(
+      ...( [nose, le, re].filter(Boolean) as { y: number }[] ).map((p) => p.y),
+      Number.POSITIVE_INFINITY,
+    )
+    const shoulderSpan =
+      ls && rs ? Math.hypot(rs.x - ls.x, rs.y - ls.y) : undefined
 
-      const upperNames = [
-        'left_elbow',
-        'left_wrist',
-        'left_finger_tip',
-        'right_elbow',
-        'right_wrist',
-        'right_finger_tip',
-      ]
+    const anchor = { ls, rs, headY: Number.isFinite(headY) ? headY : undefined, shoulderSpan }
 
-      upperNames.forEach((name) => {
-        const pt = filteredMp[name]
-        if (!pt) return
-        // 左胳膊超出左肩太多 → 判定为背景
-        if (name.startsWith('left_') && pt.x < leftMinX) {
-          delete filteredMp[name]
-        }
-        // 右胳膊超出右肩太多 → 判定为背景
-        if (name.startsWith('right_') && pt.x > rightMaxX) {
-          delete filteredMp[name]
-        }
-      })
-    }
+    // 6. 对“上肢相关的点”再来一层“头顶 + 距离肩”过滤
+    Object.entries(filtered).forEach(([name, p]) => {
+      if (pointGroup(name) !== 'upper') return
+      if (!allowUpperPoint(name, p, anchor)) {
+        delete filtered[name]
+      }
+    })
 
-    // 6. 回填上一帧，避免一闪一闪
+    // 7. 回填上一帧：回填之前也要过 allowUpperPoint，不然背景点会回来
     const EXPECTED = [
       'nose',
       'left_eye',
@@ -252,18 +286,29 @@ export default function VideoAnalyzer() {
     ]
     const last = lastDrawnRef.current
     EXPECTED.forEach((name) => {
-      if (!filteredMp[name] && last[name]) {
-        filteredMp[name] = last[name]
+      if (filtered[name]) return
+      const prev = last[name]
+      if (!prev) return
+      if (pointGroup(name) === 'upper') {
+        if (!allowUpperPoint(name, prev, anchor)) return
       }
+      // 还是要在 bbox 里
+      const inBox =
+        prev.x >= boxX - padX &&
+        prev.x <= boxX + boxW + padX &&
+        prev.y >= boxY - padY &&
+        prev.y <= boxY + boxH + padY
+      if (!inBox) return
+      filtered[name] = prev
     })
 
-    // 7. 画线
+    // 8. 画线
     const drawSeg = (pairs: [string, string][], color: string) => {
       ctx.lineWidth = 2
       ctx.strokeStyle = color
       pairs.forEach(([a, b]) => {
-        const p1 = filteredMp[a]
-        const p2 = filteredMp[b]
+        const p1 = filtered[a]
+        const p2 = filtered[b]
         if (!p1 || !p2) return
         ctx.beginPath()
         ctx.moveTo(p1.x, p1.y)
@@ -276,8 +321,8 @@ export default function VideoAnalyzer() {
     drawSeg(SEG.lower, COLOR.lower)
     drawSeg(SEG.upper, COLOR.upper)
 
-    // 8. 画点（大小是之前的一半）
-    Object.entries(filteredMp).forEach(([name, p]) => {
+    // 9. 画点（半尺寸）
+    Object.entries(filtered).forEach(([name, p]) => {
       const g = pointGroup(name)
       ctx.beginPath()
       ctx.fillStyle = COLOR[g]
@@ -288,11 +333,11 @@ export default function VideoAnalyzer() {
       ctx.stroke()
     })
 
-    // 存这一帧
-    lastDrawnRef.current = filteredMp
+    // 保存这一帧（是“安全过筛”之后的）
+    lastDrawnRef.current = filtered
   }
 
-  // 播放时画最近帧
+  // 播放时画对应帧
   const drawPoseAtTime = (t: number) => {
     const list = samplesRef.current
     if (!list.length) return
@@ -308,7 +353,7 @@ export default function VideoAnalyzer() {
     drawPose(best.pose)
   }
 
-  // 开始分析
+  // 点击开始分析
   const handleAnalyze = async () => {
     const video = videoRef.current
     if (!video || !pose) return
@@ -333,10 +378,9 @@ export default function VideoAnalyzer() {
 
     video.pause()
     video.currentTime = 0
-
     samplesRef.current = samples
 
-    // ======= 打分逻辑，保持你的 =======
+    // ====== 打分逻辑保持不变 ======
     const last = samples.at(-1)
     const kin = last ? computeAngles(last.pose) : {}
     const rel = detectRelease(samples, coach)
@@ -415,7 +459,7 @@ export default function VideoAnalyzer() {
     drawPoseAtTime(0)
   }
 
-  // 播放/seek 时保持同步
+  // 播放/seek 同步姿态
   useEffect(() => {
     const video = videoRef.current
     if (!video) return
