@@ -18,6 +18,55 @@ async function headOk(url: string) {
   }
 }
 
+// 选出“最可能是投篮的人”
+function pickPrimaryPose(
+  poses: any[],
+  videoW: number,
+  videoH: number,
+): any | null {
+  if (!poses || !poses.length) return null
+  if (poses.length === 1) return poses[0]
+
+  const cx = videoW / 2
+  const cy = videoH * 0.45 // 稍微靠上点，拍投篮一般取上半身
+
+  let best: any = null
+  let bestScore = -Infinity
+
+  for (const p of poses) {
+    const ks = (p.keypoints || []).filter((k: any) => k.score == null || k.score > 0.2)
+    if (!ks.length) continue
+    const xs = ks.map((k: any) => k.x)
+    const ys = ks.map((k: any) => k.y)
+    const minX = Math.min(...xs)
+    const maxX = Math.max(...xs)
+    const minY = Math.min(...ys)
+    const maxY = Math.max(...ys)
+    const bboxW = maxX - minX
+    const bboxH = maxY - minY
+    const area = bboxW * bboxH
+
+    const px = (minX + maxX) / 2
+    const py = (minY + maxY) / 2
+    const centerDist = Math.hypot(px - cx, py - cy)
+
+    // 看看有没有脚踝，踝子在下面的更可能是整个人
+    const ra = ks.find((k: any) => k.name === 'right_ankle')
+    const la = ks.find((k: any) => k.name === 'left_ankle')
+    const ankleY = Math.max(ra?.y ?? 0, la?.y ?? 0)
+
+    // 综合评分：面积越大越好，越在中间越好，脚越靠下越好
+    const score = area * 1.1 - centerDist * 0.4 + ankleY * 0.15
+
+    if (score > bestScore) {
+      bestScore = score
+      best = p
+    }
+  }
+
+  return best || poses[0]
+}
+
 export class PoseEngine {
   private detector?: poseDetection.PoseDetector
   private smoothers: Record<string, OneEuro2D> = {}
@@ -106,7 +155,6 @@ export class PoseEngine {
     return names[i] || ''
   }
 
-  // 统一入口
   async estimate(
     video: HTMLVideoElement | HTMLCanvasElement,
     tSec?: number,
@@ -114,28 +162,29 @@ export class PoseEngine {
     if (!this.detector) await this.load()
     if (!this.detector) return null
 
-    const poses = await this.detector.estimatePoses(video as any)
-    const p = poses?.[0]
-    if (!p) return null
+    const videoW = (video as any).videoWidth || (video as any).width || 720
+    const videoH = (video as any).videoHeight || (video as any).height || 1280
+
+    // ⭐ 这里允许多人的情况
+    const poses = await this.detector.estimatePoses(video as any, {
+      maxPoses: 4,
+      flipHorizontal: false,
+    } as any)
+
+    const primary = pickPrimaryPose(poses as any[], videoW, videoH)
+    if (!primary) return null
 
     const nowSec = typeof tSec === 'number' ? tSec : performance.now() / 1000
 
-    const kps: Keypoint[] = (p.keypoints as any).map((k: any, i: number) => ({
-      x: k.x,
-      y: k.y,
-      score: k.score,
-      name: k.name || this.kpName(i),
-    }))
-
-    // 没给 smooth 的话自己造一个
     const smCfg = this.cfg.smooth ?? {
       minCutoff: 1,
       beta: 0.02,
       dCutoff: 1,
     }
 
-    const out: Keypoint[] = kps.map((k) => {
-      const id = k.name || 'kp'
+    const kps: Keypoint[] = (primary.keypoints as any).map((k: any, i: number) => {
+      const name = k.name || this.kpName(i)
+      const id = name || 'kp'
       const smoother =
         this.smoothers[id] ||
         (this.smoothers[id] = new OneEuro2D({
@@ -144,7 +193,6 @@ export class PoseEngine {
           dCutoff: smCfg.dCutoff,
         }) as any)
 
-      // 👇 关键：兼容你项目里没有 next(...) 的 OneEuro2D
       const filtered =
         (smoother as any).next
           ? (smoother as any).next(k.x, k.y, nowSec)
@@ -152,13 +200,18 @@ export class PoseEngine {
             ? (smoother as any).filter(k.x, k.y, nowSec)
             : { x: k.x, y: k.y }
 
-      return { ...k, x: filtered.x, y: filtered.y }
+      return {
+        x: filtered.x,
+        y: filtered.y,
+        score: k.score,
+        name,
+      }
     })
 
-    // 智能裁剪（可选）
+    // 可选智能裁剪
     if (this.cfg.enableSmartCrop) {
-      const xs = out.map((k) => k.x)
-      const ys = out.map((k) => k.y)
+      const xs = kps.map((k) => k.x)
+      const ys = kps.map((k) => k.y)
       const minx = Math.min(...xs)
       const maxx = Math.max(...xs)
       const miny = Math.min(...ys)
@@ -170,13 +223,8 @@ export class PoseEngine {
     }
 
     return {
-      keypoints: out,
-      bbox: this.bbox || {
-        x: 0,
-        y: 0,
-        w: (video as any).width,
-        h: (video as any).height,
-      },
+      keypoints: kps,
+      bbox: this.bbox || { x: 0, y: 0, w: videoW, h: videoH },
     }
   }
 }
