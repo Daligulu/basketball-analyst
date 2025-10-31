@@ -1,13 +1,15 @@
 // config/coach.ts
 
+export type ScoreBetter = 'closer' | '>=|' | '<=|'
+
 export type ScoreRule = {
   target: number
   tolerance: number
-  unit?: 'deg' | 's' | 'pct' | string
-  better?: 'closer' | '>=|' | '<=|'
+  unit?: 'deg' | 'pct' | 'px' | 's'
+  better?: ScoreBetter
 }
 
-export type CoachItem = {
+export type WeightItem = {
   key: string
   label: string
   weight: number
@@ -15,9 +17,9 @@ export type CoachItem = {
 }
 
 export type WeightBucket = {
-  name: string
+  name: '下肢动力链' | '上肢出手' | '对齐与平衡' | string
   weight: number
-  items: CoachItem[]
+  items: WeightItem[]
 }
 
 export type ReleaseDetectConfig = {
@@ -25,30 +27,45 @@ export type ReleaseDetectConfig = {
   bodyWidthScale?: number
 }
 
-export type SmoothConfig = {
-  enabled?: boolean
-  freq?: number
-  minCutoff?: number
-  beta?: number
-  dCutoff?: number
+export type ScoringWindow = {
+  preReleaseSec?: number
+  postReleaseSec?: number
 }
 
 export type CoachConfig = {
-  // 👉 给 lib/pose/poseEngine.ts 用的
-  smooth?: SmoothConfig
-  // 👉 给 lib/analyze/release.ts 用的
+  modelPreference: 'blaze-full' | 'blaze-lite' | 'movenet'
+  enableSmartCrop: boolean
+  enableOpenCV: boolean
+  smooth: { minCutoff: number; beta: number; dCutoff: number }
+  thresholds: {
+    kneeMin: number
+    kneeMax: number
+    releaseAngleIdeal: number
+    lateralOffsetMaxPct: number
+  }
+  scoring?: ScoringWindow
   releaseDetect?: ReleaseDetectConfig
-  // 👉 打分权重
   weights: WeightBucket[]
 }
 
 export const DEFAULT_CONFIG: CoachConfig = {
+  modelPreference: 'movenet',
+  enableSmartCrop: true,
+  enableOpenCV: false,
   smooth: {
-    enabled: true,
-    freq: 30,
     minCutoff: 1,
     beta: 0.02,
     dCutoff: 1,
+  },
+  thresholds: {
+    kneeMin: 60,
+    kneeMax: 140,
+    releaseAngleIdeal: 115,
+    lateralOffsetMaxPct: 0.12,
+  },
+  scoring: {
+    preReleaseSec: 0.25,
+    postReleaseSec: 0.45,
   },
   releaseDetect: {
     minElbowDeg: 150,
