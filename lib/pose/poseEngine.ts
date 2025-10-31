@@ -18,58 +18,46 @@ async function headOk(url: string) {
   }
 }
 
-/**
- * 选“真正要画的那个投篮人”
- * 优先级：
- * 1. 框的中心在画面中间（0.32~0.68 之间）
- * 2. 脚在下面
- * 3. 框不要太小
- * 4. 关键点均值高
- */
+// 选真正要画的这个人：中心 + 脚在下面 + 关键点靠谱
 function pickPrimaryPose(poses: any[], videoW: number, videoH: number): any | null {
-  if (!poses || !poses.length) return null
+  if (!poses?.length) return null
   if (poses.length === 1) return poses[0]
 
-  const screenCenterX = videoW / 2
-  const centerL = videoW * 0.32
-  const centerR = videoW * 0.68
+  const centerX = videoW / 2
+  const centerBandL = videoW * 0.32
+  const centerBandR = videoW * 0.68
 
   let best: any = null
   let bestScore = -Infinity
 
   for (const p of poses) {
-    const ks = (p.keypoints || []).filter((k: any) => k.score == null || k.score > 0.15)
+    const ks = (p.keypoints || []).filter((k: any) => k.score == null || k.score > 0.12)
     if (!ks.length) continue
 
     const xs = ks.map((k: any) => k.x)
     const ys = ks.map((k: any) => k.y)
-
     const minX = Math.min(...xs)
     const maxX = Math.max(...xs)
     const minY = Math.min(...ys)
     const maxY = Math.max(...ys)
 
-    const bboxW = maxX - minX
-    const bboxH = maxY - minY
-    const area = bboxW * bboxH
-
-    const centerX = (minX + maxX) / 2
-    const centerDist = Math.abs(centerX - screenCenterX)
-
+    const w = maxX - minX
+    const h = maxY - minY
+    const area = w * h
+    const cX = (minX + maxX) / 2
+    const cDist = Math.abs(cX - centerX)
     const lowestY = maxY
-
     const avgScore =
       ks.reduce((s: number, k: any) => s + (k.score ?? 0.5), 0) / Math.max(1, ks.length)
+    const inBand = cX >= centerBandL && cX <= centerBandR
 
-    const inCenter = centerX >= centerL && centerX <= centerR
-
-    // 打分：中心奖励拉得很高，防止左边那个背景人
+    // 核心：中间的人拿巨额奖励，这样左边背景人就下去了
     const score =
-      lowestY * 1.6 + // 脚越靠下越好
-      area * 0.3 + // 框越大越好
-      -centerDist * 2.0 + // 离中越近越好
-      avgScore * 1000 + // 关键点越靠谱越好
-      (inCenter ? 2500 : 0) // 在中间直接给巨额奖励
+      lowestY * 1.5 + // 越靠下越像前景
+      area * 0.28 + // 框大小
+      -cDist * 1.6 + // 越靠中越好
+      avgScore * 900 + // 关键点质量
+      (inBand ? 2400 : 0) // 在中间直接送分
 
     if (score > bestScore) {
       bestScore = score
@@ -185,6 +173,7 @@ export class PoseEngine {
     const primary = pickPrimaryPose(poses as any[], videoW, videoH)
     if (!primary) return null
 
+    // ⭐ 一定用外面传进来的时间（就是 video.currentTime）
     const nowSec = typeof tSec === 'number' ? tSec : performance.now() / 1000
     const smCfg = this.cfg.smooth ?? { minCutoff: 1, beta: 0.02, dCutoff: 1 }
 
@@ -209,6 +198,7 @@ export class PoseEngine {
       return { x: filtered.x, y: filtered.y, score: k.score, name }
     })
 
+    // 可选裁剪
     if (this.cfg.enableSmartCrop) {
       const xs = keypoints.map((k) => k.x)
       const ys = keypoints.map((k) => k.y)
