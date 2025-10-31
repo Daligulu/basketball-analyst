@@ -9,7 +9,7 @@ import { scoreAngles } from '@/lib/score/scorer'
 import { computeAngles } from '@/lib/analyze/kinematics'
 import { detectRelease, type Sample } from '@/lib/analyze/release'
 
-// 三色骨架：红=上肢，蓝=躯干，绿=下肢（跟你原图一样的思路）
+// 三色骨架：红=上肢，蓝=躯干，绿=下肢
 const SEG: Record<'red' | 'blue' | 'green', [string, string][]> = {
   red: [
     ['left_shoulder', 'left_elbow'],
@@ -31,8 +31,8 @@ const SEG: Record<'red' | 'blue' | 'green', [string, string][]> = {
   ],
 }
 
+// 展示层最低分
 const UI_SOFT_FLOOR = 55
-
 const UNIT_CN: Record<string, string> = {
   deg: '度',
   s: '秒',
@@ -65,7 +65,13 @@ export default function VideoAnalyzer() {
     setScore(null)
   }
 
-  // 在原视频上叠加姿态
+  /**
+   * 在「原视频上」画姿态
+   * 关键点：
+   * 1. 不再 ctx.drawImage(...)，避免把视频按容器拉伸
+   * 2. 模型给的是 video.videoWidth / video.videoHeight 这套坐标
+   *    我们要按比例映射到实际显示出来的 clientWidth/clientHeight
+   */
   const drawPose = (res: any) => {
     const canvas = canvasRef.current
     const video = videoRef.current
@@ -73,20 +79,27 @@ export default function VideoAnalyzer() {
     const ctx = canvas.getContext('2d')
     if (!ctx) return
 
-    const displayW = video.clientWidth || video.videoWidth || 640
-    const displayH = video.clientHeight || video.videoHeight || 360
+    // 显示出来的尺寸（受 CSS 影响）
+    const displayW = video.clientWidth || 640
+    const displayH = video.clientHeight || 360
+    // 原始视频尺寸（模型返回的坐标用的就是这套）
+    const rawW = video.videoWidth || displayW
+    const rawH = video.videoHeight || displayH
 
+    // 画布尺寸 = 当前显示尺寸
     canvas.width = displayW
     canvas.height = displayH
-
-    // 先把当前视频帧画上去
     ctx.clearRect(0, 0, displayW, displayH)
-    ctx.drawImage(video, 0, 0, displayW, displayH)
 
+    // 从原坐标 → 显示坐标的缩放比
+    const scaleX = displayW / rawW
+    const scaleY = displayH / rawH
+
+    // 先做好查表
     const map: Record<string, { x: number; y: number }> = {}
     res.keypoints.forEach((k: any) => {
       if (!k?.name) return
-      map[k.name] = { x: k.x, y: k.y }
+      map[k.name] = { x: k.x * scaleX, y: k.y * scaleY }
     })
 
     const drawSeg = (pairs: [string, string][], color: string) => {
@@ -103,6 +116,7 @@ export default function VideoAnalyzer() {
       })
     }
 
+    // 下肢 → 躯干 → 上肢
     drawSeg(SEG.green, 'rgba(34,197,94,0.95)')
     drawSeg(SEG.blue, 'rgba(59,130,246,0.95)')
     drawSeg(SEG.red, 'rgba(248,113,113,1)')
@@ -110,28 +124,28 @@ export default function VideoAnalyzer() {
     ctx.fillStyle = 'rgba(248,113,113,1)'
     res.keypoints.forEach((k: any) => {
       if (!k?.x || !k?.y) return
+      const x = k.x * scaleX
+      const y = k.y * scaleY
       ctx.beginPath()
-      ctx.arc(k.x, k.y, 5, 0, Math.PI * 2)
+      ctx.arc(x, y, 5, 0, Math.PI * 2)
       ctx.fill()
     })
   }
 
-  // 点击「开始分析」
+  // 点击“开始分析”
   const handleAnalyze = async () => {
     const video = videoRef.current
     if (!video || !pose) return
 
     try {
       await video.play()
-    } catch {
-      // 移动端可能要手点，这里忽略
-    }
+    } catch {}
 
     setAnalyzing(true)
     const samples: Sample[] = []
     const start = performance.now()
 
-    // 最多取 4 秒
+    // 最多分析 4 秒
     while (video.currentTime <= (video.duration || 4) && video.currentTime <= 4) {
       const nowSec = (performance.now() - start) / 1000
       const res = await pose.estimate(video, nowSec)
@@ -148,7 +162,7 @@ export default function VideoAnalyzer() {
     const kin = last ? computeAngles(last.pose) : {}
     const rel = detectRelease(samples, coach)
 
-    // 再兜一层角度算法，防止“未检测”
+    // 兜一层角度，防“未检测”
     const getKP = (name: string) => last?.pose.keypoints.find((k: any) => k.name === name)
     const ensureAngle = (a: any, b: any, c: any) => {
       const v1x = a.x - b.x
@@ -161,18 +175,22 @@ export default function VideoAnalyzer() {
       return (Math.acos(Math.max(-1, Math.min(1, cos))) * 180) / Math.PI
     }
 
+    // 左膝
     if (!kin.kneeL) {
       const lh = getKP('left_hip')
       const lk = getKP('left_knee')
       const la = getKP('left_ankle')
       if (lh && lk && la) kin.kneeL = ensureAngle(lh, lk, la)
     }
+    // 右膝
     if (!kin.kneeR) {
       const rh = getKP('right_hip')
       const rk = getKP('right_knee')
       const ra = getKP('right_ankle')
       if (rh && rk && ra) kin.kneeR = ensureAngle(rh, rk, ra)
     }
+
+    // 出手角：肩-肘-腕
     if (!kin.releaseAngle) {
       const rs = getKP('right_shoulder')
       const re = getKP('right_elbow')
@@ -207,7 +225,7 @@ export default function VideoAnalyzer() {
 
     let s = scoreAngles(features, coach)
 
-    // UI 兜底：所有项最低 55
+    // UI 最低 55
     s.buckets.forEach((b: any) => {
       b.items.forEach((it: any) => {
         if (!Number.isFinite(it.score) || it.score < UI_SOFT_FLOOR) {
@@ -263,6 +281,7 @@ export default function VideoAnalyzer() {
         <p className="text-xs text-slate-400 mt-1">BUILD: coach-v3.9-release+wrist+color</p>
       </div>
 
+      {/* 工具栏 */}
       <div className="flex flex-wrap gap-3 items-center">
         <input
           type="file"
@@ -285,7 +304,7 @@ export default function VideoAnalyzer() {
         </button>
       </div>
 
-      {/* 播放区：video + 覆盖的 canvas */}
+      {/* 播放区：video + 叠加的 canvas */}
       <div className="relative w-full max-w-3xl rounded-lg overflow-hidden border border-slate-800 bg-slate-900">
         <video
           ref={videoRef}
@@ -295,6 +314,7 @@ export default function VideoAnalyzer() {
           playsInline
           muted
         />
+        {/* 这里不用设 h-full，让它跟视频一样高 */}
         <canvas ref={canvasRef} className="pointer-events-none absolute inset-0 w-full h-full" />
       </div>
 
