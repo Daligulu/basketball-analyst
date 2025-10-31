@@ -59,6 +59,7 @@ export class PoseEngine {
       return
     }
 
+    // BlazePose
     const type = pref === 'blaze-full' ? 'full' : 'lite'
     const local = '/mediapipe/pose'
     const localOk = await headOk(`${local}/pose_solution_packed_assets.data`)
@@ -105,7 +106,7 @@ export class PoseEngine {
     return names[i] || ''
   }
 
-  // 统一入口：tSec 可选；smooth 有兜底
+  // 统一入口
   async estimate(
     video: HTMLVideoElement | HTMLCanvasElement,
     tSec?: number,
@@ -126,7 +127,7 @@ export class PoseEngine {
       name: k.name || this.kpName(i),
     }))
 
-    // 👉 这里是关键：就算 cfg.smooth 没传，也自己造一个
+    // 没给 smooth 的话自己造一个
     const smCfg = this.cfg.smooth ?? {
       minCutoff: 1,
       beta: 0.02,
@@ -135,19 +136,26 @@ export class PoseEngine {
 
     const out: Keypoint[] = kps.map((k) => {
       const id = k.name || 'kp'
-      // 👉 OneEuro2D 要的是一个对象，不是三个参数
       const smoother =
         this.smoothers[id] ||
         (this.smoothers[id] = new OneEuro2D({
           minCutoff: smCfg.minCutoff,
           beta: smCfg.beta,
           dCutoff: smCfg.dCutoff,
-        }))
-      const filtered = smoother.next(k.x, k.y, nowSec)
+        }) as any)
+
+      // 👇 关键：兼容你项目里没有 next(...) 的 OneEuro2D
+      const filtered =
+        (smoother as any).next
+          ? (smoother as any).next(k.x, k.y, nowSec)
+          : (smoother as any).filter
+            ? (smoother as any).filter(k.x, k.y, nowSec)
+            : { x: k.x, y: k.y }
+
       return { ...k, x: filtered.x, y: filtered.y }
     })
 
-    // 可选智能裁剪
+    // 智能裁剪（可选）
     if (this.cfg.enableSmartCrop) {
       const xs = out.map((k) => k.x)
       const ys = out.map((k) => k.y)
