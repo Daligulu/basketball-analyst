@@ -1,6 +1,5 @@
 // lib/pose/skeleton.ts
-// 定义骨架、关键点顺序和配色
-// 注意：这个顺序要和浏览器里用的 pose 模型保持一致（BlazePose / TFJS pose-detection）
+// 姿态关键点顺序 + 三层配色骨架
 
 export type KPName =
   | 'nose'
@@ -33,8 +32,7 @@ export type KPName =
   | 'left_foot_index'
   | 'right_foot_index';
 
-// 这是给 poseEngine.ts 用的名字排序：如果当前帧的 keypoint 里没带 name，就按这个顺序去补
-// 顺序参考了 TFJS pose-detection 的 BlazePose 输出
+// 这个顺序给 poseEngine.ts 用来补名字，参考 TFJS BlazePose
 export const PRIMARY_KEYPOINT_ORDER: KPName[] = [
   'nose',
   'left_eye',
@@ -51,7 +49,7 @@ export const PRIMARY_KEYPOINT_ORDER: KPName[] = [
   'left_wrist',
   'right_wrist',
 
-  // 手部
+  // 手指区域
   'left_pinky',
   'right_pinky',
   'left_index',
@@ -59,7 +57,7 @@ export const PRIMARY_KEYPOINT_ORDER: KPName[] = [
   'left_thumb',
   'right_thumb',
 
-  // 躯干 & 下肢
+  // 躯干 + 下肢
   'left_hip',
   'right_hip',
   'left_knee',
@@ -72,12 +70,10 @@ export const PRIMARY_KEYPOINT_ORDER: KPName[] = [
   'right_foot_index',
 ];
 
-// 颜色：上肢 + 头 红色；躯干 蓝色；下肢 绿色
-export const UPPER_COLOR = '#ff5a5a'; // 红
-export const TORSO_COLOR = '#2b76ff'; // 蓝
-export const LOWER_COLOR = '#10b981'; // 绿
+export const UPPER_COLOR = '#ff5a5a'; // 红：头+上肢+手
+export const TORSO_COLOR = '#2b76ff'; // 蓝：躯干
+export const LOWER_COLOR = '#10b981'; // 绿：下肢+脚尖
 
-// 躯干连接（蓝）——这几条基本不会错位
 export const TORSO_CONNECTIONS: [KPName, KPName][] = [
   ['left_shoulder', 'right_shoulder'],
   ['left_shoulder', 'left_hip'],
@@ -85,28 +81,24 @@ export const TORSO_CONNECTIONS: [KPName, KPName][] = [
   ['left_hip', 'right_hip'],
 ];
 
-// 上肢 + 头部（红）
 export const UPPER_CONNECTIONS: [KPName, KPName][] = [
-  // 头脸
+  // 头部
   ['nose', 'left_eye'],
   ['nose', 'right_eye'],
   ['left_eye', 'left_ear'],
   ['right_eye', 'right_ear'],
   ['nose', 'mouth_left'],
   ['nose', 'mouth_right'],
-
-  // 头和肩
+  // 头到肩
   ['nose', 'left_shoulder'],
   ['nose', 'right_shoulder'],
-
-  // 左手
+  // 左臂
   ['left_shoulder', 'left_elbow'],
   ['left_elbow', 'left_wrist'],
   ['left_wrist', 'left_index'],
   ['left_wrist', 'left_pinky'],
   ['left_wrist', 'left_thumb'],
-
-  // 右手
+  // 右臂
   ['right_shoulder', 'right_elbow'],
   ['right_elbow', 'right_wrist'],
   ['right_wrist', 'right_index'],
@@ -114,7 +106,6 @@ export const UPPER_CONNECTIONS: [KPName, KPName][] = [
   ['right_wrist', 'right_thumb'],
 ];
 
-// 下肢（绿）——带脚跟和脚尖
 export const LOWER_CONNECTIONS: [KPName, KPName][] = [
   ['left_hip', 'left_knee'],
   ['left_knee', 'left_ankle'],
@@ -127,7 +118,7 @@ export const LOWER_CONNECTIONS: [KPName, KPName][] = [
   ['right_ankle', 'right_foot_index'],
 ];
 
-// 前端画线时就遍历这个
+// 前端画线用它就行了
 export const ALL_CONNECTIONS = [
   ...UPPER_CONNECTIONS.map((pair) => ({ pair, color: UPPER_COLOR })),
   ...TORSO_CONNECTIONS.map((pair) => ({ pair, color: TORSO_COLOR })),
