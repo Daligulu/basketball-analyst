@@ -9,7 +9,7 @@ import { scoreAngles } from '@/lib/score/scorer'
 import { computeAngles } from '@/lib/analyze/kinematics'
 import { detectRelease, type Sample } from '@/lib/analyze/release'
 
-// 三色骨架：红=上肢，蓝=躯干，绿=下肢
+// 三色骨架
 const SEG: Record<'red' | 'blue' | 'green', [string, string][]> = {
   red: [
     ['left_shoulder', 'left_elbow'],
@@ -31,7 +31,6 @@ const SEG: Record<'red' | 'blue' | 'green', [string, string][]> = {
   ],
 }
 
-// 展示层最低分
 const UI_SOFT_FLOOR = 55
 const UNIT_CN: Record<string, string> = {
   deg: '度',
@@ -50,13 +49,11 @@ export default function VideoAnalyzer() {
   const [openCfg, setOpenCfg] = useState(false)
   const [analyzing, setAnalyzing] = useState(false)
 
-  // 初始化姿态引擎
   useEffect(() => {
     const p = new PoseEngine(coach)
     setPose(p)
   }, [coach])
 
-  // 上传视频
   const handleFile = (e: React.ChangeEvent<HTMLInputElement>) => {
     const f = e.target.files?.[0]
     if (!f) return
@@ -66,48 +63,64 @@ export default function VideoAnalyzer() {
   }
 
   /**
-   * 在「原视频上」画姿态
-   * 关键点：
-   * 1. 不再 ctx.drawImage(...)，避免把视频按容器拉伸
-   * 2. 模型给的是 video.videoWidth / video.videoHeight 这套坐标
-   *    我们要按比例映射到实际显示出来的 clientWidth/clientHeight
+   * 真正的姿态绘制：
+   * - 不再把视频画到 canvas 上（避免“看起来被拉伸”）
+   * - 以 <video> 的真实展示区域做坐标系
+   * - 再把原始关键点按等比 + 居中偏移映射进去
    */
   const drawPose = (res: any) => {
-    const canvas = canvasRef.current
     const video = videoRef.current
-    if (!canvas || !video) return
+    const canvas = canvasRef.current
+    if (!video || !canvas) return
     const ctx = canvas.getContext('2d')
     if (!ctx) return
 
-    // 显示出来的尺寸（受 CSS 影响）
-    const displayW = video.clientWidth || 640
-    const displayH = video.clientHeight || 360
-    // 原始视频尺寸（模型返回的坐标用的就是这套）
+    // 1. 当前页面上 <video> 的真实显示尺寸（含 letterbox）
+    const rect = video.getBoundingClientRect()
+    const displayW = rect.width
+    const displayH = rect.height
+
+    // 2. 原始视频尺寸（模型返回的坐标基于这个）
     const rawW = video.videoWidth || displayW
     const rawH = video.videoHeight || displayH
 
-    // 画布尺寸 = 当前显示尺寸
-    canvas.width = displayW
-    canvas.height = displayH
+    // 3. 让 canvas 跟展示尺寸对齐
+    //   注意要乘 devicePixelRatio，不然一放大就糊
+    const dpr = typeof window !== 'undefined' ? window.devicePixelRatio || 1 : 1
+    canvas.width = displayW * dpr
+    canvas.height = displayH * dpr
+    canvas.style.width = displayW + 'px'
+    canvas.style.height = displayH + 'px'
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0) // 把之后的绘制还原到 CSS 坐标
     ctx.clearRect(0, 0, displayW, displayH)
 
-    // 从原坐标 → 显示坐标的缩放比
-    const scaleX = displayW / rawW
-    const scaleY = displayH / rawH
+    // 4. 模拟 object-fit: contain 的等比缩放
+    //    scale 是把 原视频 → 显示区域 的统一缩放
+    const scale = Math.min(displayW / rawW, displayH / rawH)
+    // 缩放完后真正占用的那块视频区域
+    const drawW = rawW * scale
+    const drawH = rawH * scale
+    // 居中后的视频在 <video> 里的偏移（上下/左右的黑边）
+    const offsetX = (displayW - drawW) / 2
+    const offsetY = (displayH - drawH) / 2
 
-    // 先做好查表
-    const map: Record<string, { x: number; y: number }> = {}
+    // 5. 把关键点变成当前坐标系
+    const mp: Record<string, { x: number; y: number }> = {}
     res.keypoints.forEach((k: any) => {
       if (!k?.name) return
-      map[k.name] = { x: k.x * scaleX, y: k.y * scaleY }
+      // 原始坐标 → 显示坐标
+      mp[k.name] = {
+        x: offsetX + k.x * scale,
+        y: offsetY + k.y * scale,
+      }
     })
 
     const drawSeg = (pairs: [string, string][], color: string) => {
       ctx.lineWidth = 4
       ctx.strokeStyle = color
       pairs.forEach(([a, b]) => {
-        const p1 = map[a]
-        const p2 = map[b]
+        const p1 = mp[a]
+        const p2 = mp[b]
         if (!p1 || !p2) return
         ctx.beginPath()
         ctx.moveTo(p1.x, p1.y)
@@ -116,23 +129,23 @@ export default function VideoAnalyzer() {
       })
     }
 
-    // 下肢 → 躯干 → 上肢
+    // 6. 画骨架
     drawSeg(SEG.green, 'rgba(34,197,94,0.95)')
     drawSeg(SEG.blue, 'rgba(59,130,246,0.95)')
     drawSeg(SEG.red, 'rgba(248,113,113,1)')
 
+    // 关键点
     ctx.fillStyle = 'rgba(248,113,113,1)'
     res.keypoints.forEach((k: any) => {
       if (!k?.x || !k?.y) return
-      const x = k.x * scaleX
-      const y = k.y * scaleY
+      const x = offsetX + k.x * scale
+      const y = offsetY + k.y * scale
       ctx.beginPath()
       ctx.arc(x, y, 5, 0, Math.PI * 2)
       ctx.fill()
     })
   }
 
-  // 点击“开始分析”
   const handleAnalyze = async () => {
     const video = videoRef.current
     if (!video || !pose) return
@@ -145,7 +158,6 @@ export default function VideoAnalyzer() {
     const samples: Sample[] = []
     const start = performance.now()
 
-    // 最多分析 4 秒
     while (video.currentTime <= (video.duration || 4) && video.currentTime <= 4) {
       const nowSec = (performance.now() - start) / 1000
       const res = await pose.estimate(video, nowSec)
@@ -153,7 +165,6 @@ export default function VideoAnalyzer() {
         drawPose(res)
         samples.push({ t: nowSec, pose: res })
       }
-
       if (video.ended || video.paused) break
       await new Promise((r) => setTimeout(r, 90))
     }
@@ -162,7 +173,6 @@ export default function VideoAnalyzer() {
     const kin = last ? computeAngles(last.pose) : {}
     const rel = detectRelease(samples, coach)
 
-    // 兜一层角度，防“未检测”
     const getKP = (name: string) => last?.pose.keypoints.find((k: any) => k.name === name)
     const ensureAngle = (a: any, b: any, c: any) => {
       const v1x = a.x - b.x
@@ -175,22 +185,18 @@ export default function VideoAnalyzer() {
       return (Math.acos(Math.max(-1, Math.min(1, cos))) * 180) / Math.PI
     }
 
-    // 左膝
     if (!kin.kneeL) {
       const lh = getKP('left_hip')
       const lk = getKP('left_knee')
       const la = getKP('left_ankle')
       if (lh && lk && la) kin.kneeL = ensureAngle(lh, lk, la)
     }
-    // 右膝
     if (!kin.kneeR) {
       const rh = getKP('right_hip')
       const rk = getKP('right_knee')
       const ra = getKP('right_ankle')
       if (rh && rk && ra) kin.kneeR = ensureAngle(rh, rk, ra)
     }
-
-    // 出手角：肩-肘-腕
     if (!kin.releaseAngle) {
       const rs = getKP('right_shoulder')
       const re = getKP('right_elbow')
@@ -225,7 +231,6 @@ export default function VideoAnalyzer() {
 
     let s = scoreAngles(features, coach)
 
-    // UI 最低 55
     s.buckets.forEach((b: any) => {
       b.items.forEach((it: any) => {
         if (!Number.isFinite(it.score) || it.score < UI_SOFT_FLOOR) {
@@ -254,23 +259,15 @@ export default function VideoAnalyzer() {
     const balance = score.buckets.find((b: any) => b.name.includes('平衡') || b.name.includes('对齐'))
     if (upper) {
       const elbow = upper.items.find((x: any) => x.key === 'elbowCurve')
-      if (elbow && elbow.score < 70) {
-        out.push('肘部路径有横向漂移，出手时让肘尖朝向篮筐，手肘不要外展。')
-      }
+      if (elbow && elbow.score < 70) out.push('肘部路径有横向漂移，出手时让肘尖朝向篮筐，手肘不要外展。')
       const release = upper.items.find((x: any) => x.key === 'releaseAngle')
-      if (release && release.score < 70) {
-        out.push('出手角稍偏，出手时前臂再竖直一点。')
-      }
+      if (release && release.score < 70) out.push('出手角稍偏，出手时前臂再竖直一点。')
     }
     if (balance) {
       const align = balance.items.find((x: any) => x.key === 'alignment')
-      if (align && align.score < 70) {
-        out.push('脚-髋-肩-腕没有完全对准篮筐，起手前把脚尖和肩都对准。')
-      }
+      if (align && align.score < 70) out.push('脚-髋-肩-腕没有完全对准篮筐，起手前把脚尖和肩都对准。')
     }
-    if (!out.length) {
-      out.push('整体姿态不错，保持当前节奏，多录几段做基线。')
-    }
+    if (!out.length) out.push('整体姿态不错，保持当前节奏，多录几段做基线。')
     return out
   })()
 
@@ -281,7 +278,6 @@ export default function VideoAnalyzer() {
         <p className="text-xs text-slate-400 mt-1">BUILD: coach-v3.9-release+wrist+color</p>
       </div>
 
-      {/* 工具栏 */}
       <div className="flex flex-wrap gap-3 items-center">
         <input
           type="file"
@@ -304,18 +300,17 @@ export default function VideoAnalyzer() {
         </button>
       </div>
 
-      {/* 播放区：video + 叠加的 canvas */}
+      {/* 播放区 */}
       <div className="relative w-full max-w-3xl rounded-lg overflow-hidden border border-slate-800 bg-slate-900">
         <video
           ref={videoRef}
           src={videoUrl ?? undefined}
-          className="w-full max-h-[360px] bg-black"
+          className="w-full max-h-[360px] bg-black object-contain"
           controls
           playsInline
           muted
         />
-        {/* 这里不用设 h-full，让它跟视频一样高 */}
-        <canvas ref={canvasRef} className="pointer-events-none absolute inset-0 w-full h-full" />
+        <canvas ref={canvasRef} className="pointer-events-none absolute inset-0" />
       </div>
 
       {/* 评分面板 */}
@@ -368,7 +363,6 @@ export default function VideoAnalyzer() {
         </div>
       )}
 
-      {/* 配置面板 */}
       {openCfg && (
         <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50">
           <div className="bg-slate-900 rounded-lg p-4 w-[min(90vw,720px)] max-h-[90vh] overflow-y-auto space-y-3">
