@@ -1,5 +1,5 @@
 // lib/analyze/release.ts
-import type { CoachConfig } from '../../config/coach'
+import type { CoachConfig } from '@/config/coach'
 
 export type Sample = {
   t: number // 秒
