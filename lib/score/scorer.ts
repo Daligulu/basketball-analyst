@@ -4,7 +4,7 @@ import {
   type CoachConfig,
   type WeightBucket,
   type ScoreRule as CoachScoreRule,
-} from '@/config/coach'
+} from '../../config/coach'
 
 export type ScoreItem = {
   key: string
@@ -13,13 +13,11 @@ export type ScoreItem = {
   value?: number
   unit?: string
 }
-
 export type Bucket = {
   name: string
   score: number
   items: ScoreItem[]
 }
-
 export type ScoreResult = {
   total: number
   buckets: Bucket[]
@@ -27,8 +25,6 @@ export type ScoreResult = {
 
 const clamp = (x: number, lo = 0, hi = 100) => Math.max(lo, Math.min(hi, x))
 const isNum = (x: any): x is number => typeof x === 'number' && Number.isFinite(x)
-
-// 算分层最低 20；UI 再拉到 55
 const FLOOR = 20
 
 function scoreByRule(value: number | undefined, rule: CoachScoreRule): number {
