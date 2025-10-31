@@ -4,7 +4,7 @@ import {
   type CoachConfig,
   type WeightBucket,
   type ScoreRule as CoachScoreRule,
-} from '../../config/coach'
+} from '@/config/coach'
 
 export type ScoreItem = {
   key: string
