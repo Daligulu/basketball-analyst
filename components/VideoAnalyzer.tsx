@@ -9,7 +9,7 @@ import { scoreAngles } from '@/lib/score/scorer'
 import { computeAngles } from '@/lib/analyze/kinematics'
 import { detectRelease, type Sample } from '@/lib/analyze/release'
 
-// 三色骨架：红=上肢，蓝=躯干，绿=下肢
+// 三色骨架：红=上肢，蓝=躯干，绿=下肢（跟你原图一样的思路）
 const SEG: Record<'red' | 'blue' | 'green', [string, string][]> = {
   red: [
     ['left_shoulder', 'left_elbow'],
@@ -31,10 +31,8 @@ const SEG: Record<'red' | 'blue' | 'green', [string, string][]> = {
   ],
 }
 
-// 展示层的最低分
 const UI_SOFT_FLOOR = 55
 
-// 单位中文
 const UNIT_CN: Record<string, string> = {
   deg: '度',
   s: '秒',
@@ -67,7 +65,7 @@ export default function VideoAnalyzer() {
     setScore(null)
   }
 
-  // 在“原视频上”画姿态
+  // 在原视频上叠加姿态
   const drawPose = (res: any) => {
     const canvas = canvasRef.current
     const video = videoRef.current
@@ -75,18 +73,16 @@ export default function VideoAnalyzer() {
     const ctx = canvas.getContext('2d')
     if (!ctx) return
 
-    // 用显示尺寸，兼容竖视频
     const displayW = video.clientWidth || video.videoWidth || 640
     const displayH = video.clientHeight || video.videoHeight || 360
 
     canvas.width = displayW
     canvas.height = displayH
 
-    // 先把视频帧画上去
+    // 先把当前视频帧画上去
     ctx.clearRect(0, 0, displayW, displayH)
     ctx.drawImage(video, 0, 0, displayW, displayH)
 
-    // keypoint map
     const map: Record<string, { x: number; y: number }> = {}
     res.keypoints.forEach((k: any) => {
       if (!k?.name) return
@@ -107,12 +103,10 @@ export default function VideoAnalyzer() {
       })
     }
 
-    // 按照你原来的那种颜色来
     drawSeg(SEG.green, 'rgba(34,197,94,0.95)')
     drawSeg(SEG.blue, 'rgba(59,130,246,0.95)')
     drawSeg(SEG.red, 'rgba(248,113,113,1)')
 
-    // 红色关键点
     ctx.fillStyle = 'rgba(248,113,113,1)'
     res.keypoints.forEach((k: any) => {
       if (!k?.x || !k?.y) return
@@ -122,39 +116,40 @@ export default function VideoAnalyzer() {
     })
   }
 
-  // 点击“开始分析”
+  // 点击「开始分析」
   const handleAnalyze = async () => {
     const video = videoRef.current
     if (!video || !pose) return
 
     try {
       await video.play()
-    } catch {}
+    } catch {
+      // 移动端可能要手点，这里忽略
+    }
 
     setAnalyzing(true)
     const samples: Sample[] = []
     const start = performance.now()
 
-    // 取 0~4 秒的帧
+    // 最多取 4 秒
     while (video.currentTime <= (video.duration || 4) && video.currentTime <= 4) {
-      const res = await pose.estimate(video)
-      drawPose(res)
-
-      const now = performance.now()
-      samples.push({ t: (now - start) / 1000, pose: res })
+      const nowSec = (performance.now() - start) / 1000
+      const res = await pose.estimate(video, nowSec)
+      if (res) {
+        drawPose(res)
+        samples.push({ t: nowSec, pose: res })
+      }
 
       if (video.ended || video.paused) break
       await new Promise((r) => setTimeout(r, 90))
     }
 
-    // ===== 特征计算 =====
     const last = samples.at(-1)
     const kin = last ? computeAngles(last.pose) : {}
     const rel = detectRelease(samples, coach)
 
-    // 再兜一层角度，防止“未检测”
+    // 再兜一层角度算法，防止“未检测”
     const getKP = (name: string) => last?.pose.keypoints.find((k: any) => k.name === name)
-
     const ensureAngle = (a: any, b: any, c: any) => {
       const v1x = a.x - b.x
       const v1y = a.y - b.y
@@ -166,26 +161,18 @@ export default function VideoAnalyzer() {
       return (Math.acos(Math.max(-1, Math.min(1, cos))) * 180) / Math.PI
     }
 
-    // 左膝
     if (!kin.kneeL) {
       const lh = getKP('left_hip')
       const lk = getKP('left_knee')
       const la = getKP('left_ankle')
-      if (lh && lk && la) {
-        kin.kneeL = ensureAngle(lh, lk, la)
-      }
+      if (lh && lk && la) kin.kneeL = ensureAngle(lh, lk, la)
     }
-    // 右膝
     if (!kin.kneeR) {
       const rh = getKP('right_hip')
       const rk = getKP('right_knee')
       const ra = getKP('right_ankle')
-      if (rh && rk && ra) {
-        kin.kneeR = ensureAngle(rh, rk, ra)
-      }
+      if (rh && rk && ra) kin.kneeR = ensureAngle(rh, rk, ra)
     }
-
-    // 出手角：肩-肘-腕
     if (!kin.releaseAngle) {
       const rs = getKP('right_shoulder')
       const re = getKP('right_elbow')
@@ -200,7 +187,6 @@ export default function VideoAnalyzer() {
       }
     }
 
-    // 要喂给打分器的特征
     const features: any = {
       kneeDepth: (() => {
         const l = kin.kneeL
@@ -219,10 +205,9 @@ export default function VideoAnalyzer() {
       alignment: rel.alignmentPct ?? 0.018,
     }
 
-    // 评分
     let s = scoreAngles(features, coach)
 
-    // UI 兜底：任何小于 55 的一律拉到 55
+    // UI 兜底：所有项最低 55
     s.buckets.forEach((b: any) => {
       b.items.forEach((it: any) => {
         if (!Number.isFinite(it.score) || it.score < UI_SOFT_FLOOR) {
@@ -244,7 +229,6 @@ export default function VideoAnalyzer() {
     setAnalyzing(false)
   }
 
-  // 建议
   const suggestions: string[] = (() => {
     if (!score) return []
     const out: string[] = []
@@ -274,13 +258,11 @@ export default function VideoAnalyzer() {
 
   return (
     <div className="space-y-4">
-      {/* 顶部 */}
       <div>
         <h1 className="text-2xl font-semibold text-slate-100">开始分析你的投篮</h1>
         <p className="text-xs text-slate-400 mt-1">BUILD: coach-v3.9-release+wrist+color</p>
       </div>
 
-      {/* 工具栏 */}
       <div className="flex flex-wrap gap-3 items-center">
         <input
           type="file"
@@ -303,7 +285,7 @@ export default function VideoAnalyzer() {
         </button>
       </div>
 
-      {/* 播放区：video + 盖上的姿态 */}
+      {/* 播放区：video + 覆盖的 canvas */}
       <div className="relative w-full max-w-3xl rounded-lg overflow-hidden border border-slate-800 bg-slate-900">
         <video
           ref={videoRef}
@@ -351,12 +333,10 @@ export default function VideoAnalyzer() {
             ))}
           </div>
 
-          {/* 雷达图 */}
           <div className="max-w-[380px]">
             <RadarChart data={score.buckets.map((b: any) => ({ label: b.name, value: b.score }))} />
           </div>
 
-          {/* 建议 */}
           <div className="rounded-lg bg-slate-800/30 border border-slate-700/30 p-3 space-y-2">
             <div className="text-slate-100 font-medium">投篮优化建议</div>
             <ul className="list-disc pl-5 text-slate-200 text-sm space-y-1">
