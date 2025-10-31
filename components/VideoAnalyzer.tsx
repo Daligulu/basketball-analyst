@@ -9,34 +9,60 @@ import { scoreAngles } from '@/lib/score/scorer'
 import { computeAngles } from '@/lib/analyze/kinematics'
 import { detectRelease, type Sample } from '@/lib/analyze/release'
 
-// 三色骨架
-const SEG: Record<'red' | 'blue' | 'green', [string, string][]> = {
-  red: [
-    ['left_shoulder', 'left_elbow'],
+const COLOR = {
+  upper: 'rgba(248,113,113,1)', // 红
+  torso: 'rgba(59,130,246,0.95)', // 蓝
+  lower: 'rgba(34,197,94,0.95)', // 绿
+}
+
+// 线的分组：跟你前面要的一样
+const SEG = {
+  upper: [
     ['left_elbow', 'left_wrist'],
-    ['right_shoulder', 'right_elbow'],
     ['right_elbow', 'right_wrist'],
-  ],
-  blue: [
+  ] as [string, string][],
+  torso: [
+    ['left_shoulder', 'right_shoulder'],
     ['left_shoulder', 'left_hip'],
     ['right_shoulder', 'right_hip'],
-    ['left_shoulder', 'right_shoulder'],
     ['left_hip', 'right_hip'],
-  ],
-  green: [
+  ] as [string, string][],
+  lower: [
     ['left_hip', 'left_knee'],
     ['left_knee', 'left_ankle'],
     ['right_hip', 'right_knee'],
     ['right_knee', 'right_ankle'],
-  ],
+  ] as [string, string][],
+}
+
+// 点属于哪个分组
+function pointGroup(name: string): 'upper' | 'torso' | 'lower' {
+  if (
+    name === 'left_elbow' ||
+    name === 'right_elbow' ||
+    name === 'left_wrist' ||
+    name === 'right_wrist'
+  ) {
+    return 'upper'
+  }
+  if (
+    name === 'left_knee' ||
+    name === 'right_knee' ||
+    name === 'left_ankle' ||
+    name === 'right_ankle' ||
+    name === 'left_foot_index' ||
+    name === 'right_foot_index' ||
+    name === 'left_heel' ||
+    name === 'right_heel'
+  ) {
+    return 'lower'
+  }
+  // 肩 & 髋 归躯干
+  return 'torso'
 }
 
 const UI_SOFT_FLOOR = 55
-const UNIT_CN: Record<string, string> = {
-  deg: '度',
-  s: '秒',
-  pct: '%',
-}
+const UNIT_CN: Record<string, string> = { deg: '度', s: '秒', pct: '%' }
 
 export default function VideoAnalyzer() {
   const videoRef = useRef<HTMLVideoElement | null>(null)
@@ -62,12 +88,6 @@ export default function VideoAnalyzer() {
     setScore(null)
   }
 
-  /**
-   * 真正的姿态绘制：
-   * - 不再把视频画到 canvas 上（避免“看起来被拉伸”）
-   * - 以 <video> 的真实展示区域做坐标系
-   * - 再把原始关键点按等比 + 居中偏移映射进去
-   */
   const drawPose = (res: any) => {
     const video = videoRef.current
     const canvas = canvasRef.current
@@ -75,46 +95,38 @@ export default function VideoAnalyzer() {
     const ctx = canvas.getContext('2d')
     if (!ctx) return
 
-    // 1. 当前页面上 <video> 的真实显示尺寸（含 letterbox）
     const rect = video.getBoundingClientRect()
     const displayW = rect.width
     const displayH = rect.height
-
-    // 2. 原始视频尺寸（模型返回的坐标基于这个）
     const rawW = video.videoWidth || displayW
     const rawH = video.videoHeight || displayH
 
-    // 3. 让 canvas 跟展示尺寸对齐
-    //   注意要乘 devicePixelRatio，不然一放大就糊
     const dpr = typeof window !== 'undefined' ? window.devicePixelRatio || 1 : 1
     canvas.width = displayW * dpr
     canvas.height = displayH * dpr
     canvas.style.width = displayW + 'px'
     canvas.style.height = displayH + 'px'
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0) // 把之后的绘制还原到 CSS 坐标
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
     ctx.clearRect(0, 0, displayW, displayH)
 
-    // 4. 模拟 object-fit: contain 的等比缩放
-    //    scale 是把 原视频 → 显示区域 的统一缩放
+    // 跟 video 一样的 contain 算法
     const scale = Math.min(displayW / rawW, displayH / rawH)
-    // 缩放完后真正占用的那块视频区域
     const drawW = rawW * scale
     const drawH = rawH * scale
-    // 居中后的视频在 <video> 里的偏移（上下/左右的黑边）
     const offsetX = (displayW - drawW) / 2
     const offsetY = (displayH - drawH) / 2
 
-    // 5. 把关键点变成当前坐标系
+    // 先做一个查表
     const mp: Record<string, { x: number; y: number }> = {}
     res.keypoints.forEach((k: any) => {
       if (!k?.name) return
-      // 原始坐标 → 显示坐标
       mp[k.name] = {
         x: offsetX + k.x * scale,
         y: offsetY + k.y * scale,
       }
     })
 
+    // 先画躯干，再腿，再手臂，防止手臂盖住身体线条
     const drawSeg = (pairs: [string, string][], color: string) => {
       ctx.lineWidth = 4
       ctx.strokeStyle = color
@@ -129,15 +141,18 @@ export default function VideoAnalyzer() {
       })
     }
 
-    // 6. 画骨架
-    drawSeg(SEG.green, 'rgba(34,197,94,0.95)')
-    drawSeg(SEG.blue, 'rgba(59,130,246,0.95)')
-    drawSeg(SEG.red, 'rgba(248,113,113,1)')
+    // 躯干蓝
+    drawSeg(SEG.torso, COLOR.torso)
+    // 下肢绿
+    drawSeg(SEG.lower, COLOR.lower)
+    // 上肢红
+    drawSeg(SEG.upper, COLOR.upper)
 
-    // 关键点
-    ctx.fillStyle = 'rgba(248,113,113,1)'
+    // 点：按分组上色
     res.keypoints.forEach((k: any) => {
-      if (!k?.x || !k?.y) return
+      if (!k?.x || !k?.y || !k?.name) return
+      const group = pointGroup(k.name)
+      ctx.fillStyle = COLOR[group]
       const x = offsetX + k.x * scale
       const y = offsetY + k.y * scale
       ctx.beginPath()
@@ -146,18 +161,16 @@ export default function VideoAnalyzer() {
     })
   }
 
+  // 下面分析部分和上一版一样，就不重复解释了
   const handleAnalyze = async () => {
     const video = videoRef.current
     if (!video || !pose) return
-
     try {
       await video.play()
     } catch {}
-
     setAnalyzing(true)
     const samples: Sample[] = []
     const start = performance.now()
-
     while (video.currentTime <= (video.duration || 4) && video.currentTime <= 4) {
       const nowSec = (performance.now() - start) / 1000
       const res = await pose.estimate(video, nowSec)
@@ -230,24 +243,17 @@ export default function VideoAnalyzer() {
     }
 
     let s = scoreAngles(features, coach)
-
     s.buckets.forEach((b: any) => {
       b.items.forEach((it: any) => {
-        if (!Number.isFinite(it.score) || it.score < UI_SOFT_FLOOR) {
-          it.score = UI_SOFT_FLOOR
-        }
+        if (!Number.isFinite(it.score) || it.score < UI_SOFT_FLOOR) it.score = UI_SOFT_FLOOR
       })
-      const avg =
-        b.items.reduce(
-          (sum: number, it: any) => sum + (Number.isFinite(it.score) ? it.score : UI_SOFT_FLOOR),
-          0,
-        ) / Math.max(1, b.items.length)
-      b.score = Math.round(avg)
+      b.score = Math.round(
+        b.items.reduce((sum: number, it: any) => sum + it.score, 0) / Math.max(1, b.items.length),
+      )
     })
-    const total =
-      s.buckets.reduce((sum: number, b: any) => sum + b.score, 0) / Math.max(1, s.buckets.length)
-    s.total = Math.round(total)
-
+    s.total = Math.round(
+      s.buckets.reduce((sum: number, b: any) => sum + b.score, 0) / Math.max(1, s.buckets.length),
+    )
     setScore(s)
     setAnalyzing(false)
   }
@@ -300,7 +306,6 @@ export default function VideoAnalyzer() {
         </button>
       </div>
 
-      {/* 播放区 */}
       <div className="relative w-full max-w-3xl rounded-lg overflow-hidden border border-slate-800 bg-slate-900">
         <video
           ref={videoRef}
@@ -313,9 +318,8 @@ export default function VideoAnalyzer() {
         <canvas ref={canvasRef} className="pointer-events-none absolute inset-0" />
       </div>
 
-      {/* 评分面板 */}
       {score && (
-        <div className="space-y-3">
+        <>
           <div className="text-lg font-semibold text-slate-100">总分：{score.total}</div>
           <div className="grid gap-3 md:grid-cols-2">
             {score.buckets.map((b: any) => (
@@ -347,20 +351,10 @@ export default function VideoAnalyzer() {
               </div>
             ))}
           </div>
-
           <div className="max-w-[380px]">
             <RadarChart data={score.buckets.map((b: any) => ({ label: b.name, value: b.score }))} />
           </div>
-
-          <div className="rounded-lg bg-slate-800/30 border border-slate-700/30 p-3 space-y-2">
-            <div className="text-slate-100 font-medium">投篮优化建议</div>
-            <ul className="list-disc pl-5 text-slate-200 text-sm space-y-1">
-              {suggestions.map((s) => (
-                <li key={s}>{s}</li>
-              ))}
-            </ul>
-          </div>
-        </div>
+        </>
       )}
 
       {openCfg && (
