@@ -1,109 +1,86 @@
 // lib/pose/oneEuro2d.ts
-// 一个非常轻量的 One Euro Filter，实现 2D 点平滑，完全跑在前端
-// 主要用来消掉 Mediapipe 偶尔的抖点，给姿态线条稳定一点的视觉效果
+// 一个非常小的 One Euro Filter 2D 版本，给关键点做平滑。
+// 只依赖 TS，本身不会触发浏览器 API，所以在 Vercel build 阶段没问题。
 
-export interface OneEuroConfig {
-  minCutoff: number; // 默认 1.0~1.2
-  beta: number; // 默认 0.0~0.1
-  dCutoff: number; // 默认 1.0
-}
+export type OneEuroConfig = {
+  minCutoff: number; // 越大越不平滑，1.0~1.5 比较合适
+  beta: number;      // 越大越跟得紧，0.03~0.1
+  dCutoff: number;   // 差分滤波器的 cutoff，一般 1.0
+};
 
-class LowPassFilter {
-  private y: number;
-  private a: number;
-  private s: boolean;
+const TWO_PI = 2 * Math.PI;
 
-  constructor(alpha: number, initValue: number) {
-    this.y = initValue;
-    this.a = alpha;
-    this.s = false;
-  }
-
-  filter(value: number, alpha: number): number {
-    if (!this.s) {
-      this.y = value;
-      this.s = true;
-      return value;
-    }
-    this.a = alpha;
-    this.y = this.a * value + (1 - this.a) * this.y;
-    return this.y;
-  }
-
-  lastValue() {
-    return this.y;
-  }
-}
-
-function smoothingFactor(t_e: number, cutoff: number): number {
-  const r = 2 * Math.PI * cutoff * t_e;
+function smoothingFactor(tE: number, cutoff: number) {
+  const r = 2 * Math.PI * cutoff * tE;
   return r / (r + 1);
 }
 
-function exponentialSmoothing(a: number, x: number, xPrev: number): number {
+function exponentialSmoothing(a: number, x: number, xPrev: number) {
   return a * x + (1 - a) * xPrev;
 }
 
-class OneEuroFilter {
-  private freq: number;
-  private minCutoff: number;
-  private beta: number;
-  private dCutoff: number;
-  private x: LowPassFilter | null;
-  private dx: LowPassFilter | null;
-  private lastTime: number | null;
+class OneEuro1D {
+  private xPrev = 0;
+  private dxPrev = 0;
+  private tPrev = 0;
+  private hasPrev = false;
+  private readonly cfg: OneEuroConfig;
 
-  constructor(freq: number, minCutoff: number, beta: number, dCutoff: number) {
-    this.freq = freq;
-    this.minCutoff = minCutoff;
-    this.beta = beta;
-    this.dCutoff = dCutoff;
-    this.x = null;
-    this.dx = null;
-    this.lastTime = null;
+  constructor(cfg: OneEuroConfig) {
+    this.cfg = cfg;
   }
 
-  filter(t: number, value: number): number {
-    if (this.lastTime != null && t !== this.lastTime) {
-      this.freq = 1.0 / (t - this.lastTime);
-    }
-    this.lastTime = t;
-
-    if (!this.dx) {
-      this.dx = new LowPassFilter(1, 0.0);
-    }
-    const dValue = this.dx.filter(
-      this.freq ? (value - (this.x ? this.x.lastValue() : value)) * this.freq : 0.0,
-      smoothingFactor(1.0 / this.freq, this.dCutoff),
-    );
-
-    const cutoff = this.minCutoff + this.beta * Math.abs(dValue);
-
-    if (!this.x) {
-      this.x = new LowPassFilter(1, value);
+  filter(x: number, t: number) {
+    if (!this.hasPrev) {
+      this.hasPrev = true;
+      this.tPrev = t;
+      this.xPrev = x;
+      this.dxPrev = 0;
+      return x;
     }
 
-    return this.x.filter(value, smoothingFactor(1.0 / this.freq, cutoff));
+    const dt = Math.max(t - this.tPrev, 1e-6);
+
+    // 1. 先滤速度
+    const dx = (x - this.xPrev) / dt;
+    const aD = smoothingFactor(dt, this.cfg.dCutoff);
+    const dxHat = exponentialSmoothing(aD, dx, this.dxPrev);
+
+    // 2. 再根据速度调节主滤波器的 cutoff
+    const cutoff = this.cfg.minCutoff + this.cfg.beta * Math.abs(dxHat);
+    const a = smoothingFactor(dt, cutoff);
+    const xHat = exponentialSmoothing(a, x, this.xPrev);
+
+    this.xPrev = xHat;
+    this.dxPrev = dxHat;
+    this.tPrev = t;
+
+    return xHat;
   }
 }
 
-// 真正对 (x, y) 做平滑的这个类
 export class OneEuro2D {
-  private fx: OneEuroFilter;
-  private fy: OneEuroFilter;
+  private fx: OneEuro1D;
+  private fy: OneEuro1D;
 
   constructor(cfg: OneEuroConfig) {
-    const minCutoff = cfg.minCutoff ?? 1.15;
-    const beta = cfg.beta ?? 0.0;
-    const dCutoff = cfg.dCutoff ?? 1.0;
-    // 初始频率随便给个 60
-    this.fx = new OneEuroFilter(60, minCutoff, beta, dCutoff);
-    this.fy = new OneEuroFilter(60, minCutoff, beta, dCutoff);
+    this.fx = new OneEuro1D(cfg);
+    this.fy = new OneEuro1D(cfg);
   }
 
-  filter(x: number, y: number, t: number): { x: number; y: number } {
-    const nx = this.fx.filter(t, x);
-    const ny = this.fy.filter(t, y);
-    return { x: nx, y: ny };
+  filter(pt: { x: number; y: number }, t: number) {
+    return {
+      x: this.fx.filter(pt.x, t),
+      y: this.fy.filter(pt.y, t),
+    };
   }
+}
+
+// 工具函数：项目里经常要一个默认配置
+export function makeDefaultOneEuro(): OneEuroConfig {
+  return {
+    minCutoff: 1.15,
+    beta: 0.05,
+    dCutoff: 1.0,
+  };
 }
