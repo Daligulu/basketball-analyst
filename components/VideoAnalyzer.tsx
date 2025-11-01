@@ -5,9 +5,9 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { PoseEngine, type PoseResult } from '@/lib/pose/poseEngine';
 import ScoreRadar from '@/components/ScoreRadar';
 import {
-  DEFAULT_ANALYZE_CONFIG,
   loadAnalyzeConfig,
   saveAnalyzeConfig,
+  DEFAULT_ANALYZE_CONFIG,
   type AnalyzeConfig,
 } from '@/lib/analyze/config';
 import { scoreFromPose, EMPTY_SCORE, type AnalyzeScore } from '@/lib/analyze/scoring';
@@ -20,6 +20,8 @@ import {
 
 type MPose = any;
 
+// 本地优先的尝试路径（给你本地开发用）
+// 线上 vercel 我们会自动走 CDN
 const MP_LOCAL_BASES = ['/mediapipe/pose', '/pose'];
 const MP_CDN_BASE = 'https://cdn.jsdelivr.net/npm/@mediapipe/pose@0.5';
 
@@ -29,7 +31,6 @@ async function loadScriptOnce(src: string) {
       reject(new Error('no document'));
       return;
     }
-    // 已经加载过了就不再加载
     if (document.querySelector(`script[data-src="${src}"]`)) {
       resolve();
       return;
@@ -44,22 +45,28 @@ async function loadScriptOnce(src: string) {
   });
 }
 
-// 尝试本地 → 不行再 CDN
+// 把真正的“加载 mediapipe pose.js”拆出来
 async function ensureMediapipePoseLoaded(): Promise<boolean> {
   if (typeof window === 'undefined') return false;
   if ((window as any).Pose) return true;
 
-  // 本地尝试
-  for (const base of MP_LOCAL_BASES) {
-    try {
-      await loadScriptOnce(`${base}/pose.js`);
-      if ((window as any).Pose) return true;
-    } catch {
-      // 忽略，继续下一条
+  // 本地开发：可以走本地
+  const isLocalhost =
+    typeof window !== 'undefined' &&
+    (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1');
+
+  if (isLocalhost) {
+    for (const base of MP_LOCAL_BASES) {
+      try {
+        await loadScriptOnce(`${base}/pose.js`);
+        if ((window as any).Pose) return true;
+      } catch {
+        // 失败就换下一个
+      }
     }
   }
 
-  // CDN 兜底
+  // vercel 或本地都没有，就走 CDN
   try {
     await loadScriptOnce(`${MP_CDN_BASE}/pose.js`);
     return !!(window as any).Pose;
@@ -80,11 +87,11 @@ export default function VideoAnalyzer() {
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [poseReady, setPoseReady] = useState(false);
   const [scores, setScores] = useState<AnalyzeScore>(EMPTY_SCORE);
-  const [cfg, setCfg] = useState<AnalyzeConfig>(() => loadAnalyzeConfig());
+  const [cfg, setCfg] = useState<AnalyzeConfig>(() => loadAnalyzeConfig() ?? DEFAULT_ANALYZE_CONFIG);
   const [showConfig, setShowConfig] = useState(false);
   const [videoSize, setVideoSize] = useState<{ w: number; h: number }>({ w: 0, h: 0 });
 
-  // 初始化平滑引擎
+  // 1. 初始化平滑引擎（只做关键点选人 + OneEuro）
   useEffect(() => {
     engineRef.current = new PoseEngine({
       smooth: {
@@ -96,36 +103,38 @@ export default function VideoAnalyzer() {
     });
   }, [cfg.pose.smoothMinCutoff, cfg.pose.smoothBeta, cfg.pose.kpMinScore]);
 
-  // 页面加载时就先把 mediapipe 拉起来
+  // 2. 页面一进来就先加载 mediapipe（防止你点按钮才去下 CDN）
   useEffect(() => {
-    let stopped = false;
+    let destroy = false;
     (async () => {
       if (typeof window === 'undefined') return;
-
       const ok = await ensureMediapipePoseLoaded();
-      if (stopped) return;
-
+      if (destroy) return;
       if (!ok) {
         setPoseReady(false);
         return;
       }
 
       const PoseCtor = (window as any).Pose as any;
+
+      // 这里是关键：Vercel 上统一走 CDN；本地才走 /mediapipe/pose
+      const isLocalhost =
+        typeof window !== 'undefined' &&
+        (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1');
+
       const pose = new PoseCtor({
         locateFile: (file: string) => {
-          // 优先走本地路径
-          if (typeof window !== 'undefined') {
-            for (const base of MP_LOCAL_BASES) {
-              // 这里不需要 @ts-expect-error，因为 window 已经判断过
-              return `${base}/${file}`;
-            }
+          if (isLocalhost) {
+            // 本地想从 public/mediapipe/pose 走
+            return `/mediapipe/pose/${file}`;
           }
-          // 兜底走 CDN
+          // 线上全部走 CDN，避免 404 卡住
           return `${MP_CDN_BASE}/${file}`;
         },
       });
 
       pose.setOptions({
+        // 你可以在面板里切 lite / full
         modelComplexity: cfg.pose.modelComplexity === 'lite' ? 0 : 1,
         smoothLandmarks: true,
         enableSegmentation: false,
@@ -133,16 +142,19 @@ export default function VideoAnalyzer() {
         minTrackingConfidence: 0.5,
       });
 
+      // 收到结果 → 走我们自己的平滑 + 评分 + 画图
       pose.onResults((res: any) => {
-        const poseLandmarks = res.poseLandmarks as Array<any> | undefined;
-        if (!poseLandmarks || !engineRef.current || !videoRef.current || !canvasRef.current) {
+        const landmarks: Array<any> | undefined = res.poseLandmarks;
+        if (!landmarks || !engineRef.current || !videoRef.current || !canvasRef.current) {
           return;
         }
 
+        // mediapipe 是 33 个点，转成我们统一的结构
+        const v = videoRef.current;
         const persons = [
           {
             score: 1,
-            keypoints: poseLandmarks.map((lm, idx) => {
+            keypoints: landmarks.map((lm, idx) => {
               const names = [
                 'nose',
                 'left_eye_inner',
@@ -178,15 +190,11 @@ export default function VideoAnalyzer() {
                 'left_foot_index',
                 'right_foot_index',
               ] as const;
-
               const name = names[idx] ?? `kp_${idx}`;
-              const v = videoRef.current!;
-              const x = lm.x * v.videoWidth;
-              const y = lm.y * v.videoHeight;
               return {
                 name,
-                x,
-                y,
+                x: lm.x * v.videoWidth,
+                y: lm.y * v.videoHeight,
                 z: lm.z,
                 score: lm.visibility ?? 1,
               };
@@ -209,10 +217,11 @@ export default function VideoAnalyzer() {
     })();
 
     return () => {
-      stopped = true;
+      destroy = true;
     };
   }, [cfg]);
 
+  // 3. 画姿态的函数
   const drawPoseOnCanvas = (person: PoseResult | null, curCfg: AnalyzeConfig) => {
     const cvs = canvasRef.current;
     const vid = videoRef.current;
@@ -226,7 +235,7 @@ export default function VideoAnalyzer() {
     const minScore = curCfg.pose.kpMinScore;
     const r = 3;
 
-    // 画点
+    // 点
     for (const kp of person.keypoints) {
       if ((kp.score ?? 0) < minScore) continue;
       let color = UPPER_COLOR;
@@ -249,14 +258,13 @@ export default function VideoAnalyzer() {
       ) {
         color = LOWER_COLOR;
       }
-
       ctx.fillStyle = color;
       ctx.beginPath();
       ctx.arc(kp.x, kp.y, r, 0, Math.PI * 2);
       ctx.fill();
     }
 
-    // 画骨架
+    // 线
     for (const { pair, color } of ALL_CONNECTIONS) {
       const [aName, bName] = pair;
       const a = person.keypoints.find((k) => k.name === aName);
@@ -275,6 +283,40 @@ export default function VideoAnalyzer() {
     }
   };
 
+  // 4. 播放视频后，循环送帧给 mediapipe
+  const analyzeLoop = useCallback(async () => {
+    const vid = videoRef.current;
+    const pose = mpPoseRef.current;
+    if (!vid || !pose) return;
+
+    // 用 RAF + await 的组合
+    const tick = async () => {
+      const v = videoRef.current;
+      const p = mpPoseRef.current;
+      if (!v || !p) {
+        setIsAnalyzing(false);
+        return;
+      }
+      if (v.paused || v.ended) {
+        setIsAnalyzing(false);
+        return;
+      }
+
+      try {
+        await p.send({ image: v });
+      } catch (err) {
+        console.error('mediapipe pose send error:', err);
+        setIsAnalyzing(false);
+        return;
+      }
+
+      requestAnimationFrame(tick);
+    };
+
+    requestAnimationFrame(tick);
+  }, []);
+
+  // 5. 选文件
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const f = e.target.files?.[0];
     if (!f) return;
@@ -285,6 +327,7 @@ export default function VideoAnalyzer() {
     setIsAnalyzing(false);
   };
 
+  // 6. 视频尺寸同步到画布
   const handleLoadedMetadata = () => {
     const vid = videoRef.current;
     const cvs = canvasRef.current;
@@ -294,27 +337,20 @@ export default function VideoAnalyzer() {
     setVideoSize({ w: vid.videoWidth, h: vid.videoHeight });
   };
 
-  const analyzeLoop = useCallback(async () => {
-    const vid = videoRef.current;
-    const pose = mpPoseRef.current;
-    if (!vid || !pose) return;
-    if (vid.paused || vid.ended) return;
-    await pose.send({ image: vid });
-    requestAnimationFrame(analyzeLoop);
-  }, []);
-
+  // 7. 开始分析
   const handleStart = async () => {
     if (!videoRef.current) return;
     if (!poseReady) {
-      alert('Mediapipe Pose 还没加载好，1 秒后再点一次；也可以把 /public/mediapipe/pose 放上去会更快。');
+      alert('Mediapipe Pose 还没加载好，再点一次即可；或把 mediapipe 放到 /public/mediapipe/pose 下。');
       return;
     }
     setIsAnalyzing(true);
     videoRef.current.currentTime = 0;
     await videoRef.current.play();
-    requestAnimationFrame(analyzeLoop);
+    analyzeLoop();
   };
 
+  // 8. 配置变化要持久化 + 重新评分
   const updateCfg = (next: AnalyzeConfig) => {
     setCfg(next);
     saveAnalyzeConfig(next);
@@ -323,7 +359,7 @@ export default function VideoAnalyzer() {
 
   return (
     <div className="space-y-5">
-      {/* 顶部 */}
+      {/* 顶部标题 + 配置按钮 */}
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-2xl font-semibold text-slate-100">开始分析你的投篮</h1>
@@ -339,7 +375,7 @@ export default function VideoAnalyzer() {
         </button>
       </div>
 
-      {/* 上传 & 控制 */}
+      {/* 上传 & 操作 */}
       <div className="flex gap-3 flex-wrap">
         <label className="flex items-center gap-2 bg-slate-900 border border-slate-700 px-4 py-2 rounded cursor-pointer text-slate-100">
           选取文件
@@ -348,7 +384,6 @@ export default function VideoAnalyzer() {
             <span className="text-xs text-slate-300 max-w-[160px] truncate">{file.name}</span>
           ) : null}
         </label>
-
         <button
           onClick={handleStart}
           disabled={!videoUrl}
@@ -360,7 +395,7 @@ export default function VideoAnalyzer() {
         </button>
       </div>
 
-      {/* 视频 */}
+      {/* 视频 + 覆盖层 */}
       <div
         className="relative bg-black rounded-lg overflow-hidden"
         style={{
@@ -388,14 +423,10 @@ export default function VideoAnalyzer() {
         )}
       </div>
 
-      {/* 雷达图 */}
-      <ScoreRadar
-        lower={scores.lower.score}
-        upper={scores.upper.score}
-        balance={scores.balance.score}
-      />
+      {/* 雷达图（不含总分） */}
+      <ScoreRadar lower={scores.lower.score} upper={scores.upper.score} balance={scores.balance.score} />
 
-      {/* 得分面板 */}
+      {/* 评分面板 */}
       <div className="space-y-4">
         <div className="text-slate-100 text-lg font-medium">总分：{scores.total}</div>
 
@@ -486,7 +517,7 @@ export default function VideoAnalyzer() {
         </div>
       </div>
 
-      {/* 配置面板 */}
+      {/* 配置面板（底部抽屉） */}
       {showConfig ? (
         <div className="fixed inset-x-0 bottom-0 bg-slate-900/95 border-t border-slate-700 px-4 py-4 space-y-3 max-h-[75vh] overflow-y-auto">
           <div className="flex justify-between items-center mb-1">
@@ -499,6 +530,7 @@ export default function VideoAnalyzer() {
             </button>
           </div>
 
+          {/* 模型 & 姿态 */}
           <div className="grid grid-cols-2 gap-3 text-xs text-slate-100">
             <div>
               <div className="text-slate-300 mb-1">模型复杂度</div>
@@ -563,12 +595,12 @@ export default function VideoAnalyzer() {
             </div>
           </div>
 
-          {/* 评分项 */}
-          <div className="text-slate-300 text-xs mt-2">评分 100 分对应值</div>
+          {/* 评分 100 分对应值 */}
+          <div className="text-slate-300 text-xs mt-2 mb-1">评分 100 分对应的实际值</div>
           <div className="grid grid-cols-2 gap-3 text-xs text-slate-100">
             {/* 下肢 */}
             <div>
-              <div className="text-slate-400 mb-1">下蹲膝角 = 100 分</div>
+              <div className="text-slate-400 mb-1">下蹲膝角(°) = 100 分</div>
               <input
                 type="number"
                 className="bg-slate-800/80 rounded px-2 py-1 w-full"
@@ -738,8 +770,8 @@ export default function VideoAnalyzer() {
           </div>
 
           <p className="text-slate-500 text-[10px] mt-3 mb-1">
-            * 为了移动端加载更快：可以把 <code>@mediapipe/pose</code> 包里的文件直接放到
-            <code>public/mediapipe/pose</code>，组件会优先走本地，不行再走 CDN。
+            为了移动端更快：把 <code>@mediapipe/pose@0.5</code> 里的文件拷到
+            <code>public/mediapipe/pose</code>，本地就走本地，不用下 CDN 了。
           </p>
         </div>
       ) : null}
