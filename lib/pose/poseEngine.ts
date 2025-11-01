@@ -1,7 +1,8 @@
 // lib/pose/poseEngine.ts
-// 把“多人检测一帧” → 选出前景投篮的人 → 按关键点做平滑 → 返回给前端画
+// 统一的姿态结果结构 + 选人 + 平滑
+// 给已有的 lib/analyze/*.ts 用的
 
-import { OneEuro2D, type OneEuroConfig } from './oneEuro2d';
+import { OneEuro2D, OneEuroConfig } from './oneEuro2d';
 
 export type PoseKeypoint = {
   name: string;
@@ -10,131 +11,62 @@ export type PoseKeypoint = {
   score?: number;
 };
 
-export type RawPerson = {
-  keypoints: PoseKeypoint[];
-  score?: number;
-};
-
-export type PoseFrame = {
-  persons: RawPerson[];
-  /** ms 时间戳 */
-  ts: number;
-};
-
 export type PoseResult = {
   keypoints: PoseKeypoint[];
-  ts: number;
+  box?: { x: number; y: number; width: number; height: number };
+  score?: number;
+  ts?: number;
 };
 
-export type CoachConfig = {
-  /** 全局平滑配置，可不传 */
-  smooth?: OneEuroConfig;
+export type MultiPersonFrame = {
+  persons: PoseResult[];
+  ts: number; // ms
 };
 
-// 哪些点我们认为是“前景最重要”的，用来挑那个真正投篮的人
-const IMPORTANT_JOINTS = [
-  'nose',
-  'left_shoulder',
-  'right_shoulder',
-  'left_hip',
-  'right_hip',
-  'left_wrist',
-  'right_wrist',
-];
+type EngineOpts = {
+  smooth?: Partial<OneEuroConfig>;
+};
 
 export class PoseEngine {
-  private cfg: CoachConfig;
-  // 每个关键点一个滤波器
-  private filters = new Map<string, OneEuro2D>();
+  private smoothers: Record<string, OneEuro2D> = {};
+  private smoothCfg: OneEuroConfig;
 
-  constructor(cfg: CoachConfig = {}) {
-    this.cfg = cfg;
+  constructor(opts?: EngineOpts) {
+    this.smoothCfg = {
+      minCutoff: 1.15,
+      beta: 0.05,
+      dCutoff: 1.0,
+      ...(opts?.smooth ?? {}),
+    };
   }
 
-  /**
-   * 选一个最像投篮主体的人
-   * 策略：score 高 + 靠画面中间 + 靠下
-   */
-  private pickPerson(frame: PoseFrame): RawPerson | null {
+  // 只要一个人：选得分最高的那个人 + 平滑
+  process(frame: MultiPersonFrame): PoseResult | null {
     if (!frame.persons || frame.persons.length === 0) return null;
 
-    const centerX = 0.5 *
-      (frame.persons[0]?.keypoints?.[0]?.x
-        ? // 有像素，就用第一帧视频宽度的一半，这个值其实没法这里拿到，就用 0～1 归一做个近似
-          1
-        : 1);
-    // 上面这块其实用不到真实宽度，我们主要靠 score 来排
+    const best = [...frame.persons]
+      .map((p) => ({
+        p,
+        sc:
+          p.score ??
+          p.keypoints.reduce((s, k) => s + (k.score ?? 0), 0) / Math.max(p.keypoints.length, 1),
+      }))
+      .sort((a, b) => b.sc - a.sc)[0].p;
 
-    let best: RawPerson | null = null;
-    let bestScore = -Infinity;
+    const tSec = frame.ts / 1000;
 
-    for (const p of frame.persons) {
-      if (!p.keypoints || p.keypoints.length === 0) continue;
-
-      // 基础分：检测器给的
-      const base = typeof p.score === 'number' ? p.score * 100 : 0;
-
-      // 取一下肩膀/髋部，估计一下“在不在中间”
-      const ls = p.keypoints.find((k) => k.name === 'left_shoulder');
-      const rs = p.keypoints.find((k) => k.name === 'right_shoulder');
-      const lh = p.keypoints.find((k) => k.name === 'left_hip');
-      const rh = p.keypoints.find((k) => k.name === 'right_hip');
-
-      const cx =
-        ((ls?.x ?? rs?.x ?? lh?.x ?? rh?.x) ?? 0) / 1000; // 粗糙归一化，防止 NaN
-      const cy =
-        ((ls?.y ?? rs?.y ?? lh?.y ?? rh?.y) ?? 0) / 1000;
-
-      // 越靠下越像前景
-      const bonusY = cy * 50;
-      // 越靠中间越好（这里中心写死 0.5）
-      const distToCenter = Math.abs(cx - 0.5);
-      const bonusX = (1 - distToCenter) * 40;
-
-      const total = base + bonusX + bonusY;
-
-      if (total > bestScore) {
-        bestScore = total;
-        best = p;
+    const keypoints = best.keypoints.map((kp) => {
+      const id = kp.name;
+      if (!this.smoothers[id]) {
+        this.smoothers[id] = new OneEuro2D(this.smoothCfg);
       }
-    }
-
-    return best;
-  }
-
-  private getFilter(jointName: string): OneEuro2D | null {
-    const base = this.cfg.smooth;
-    if (!base) return null;
-    let f = this.filters.get(jointName);
-    if (!f) {
-      f = new OneEuro2D(base);
-      this.filters.set(jointName, f);
-    }
-    return f;
-  }
-
-  /**
-   * 外部真正调用的接口
-   */
-  process(frame: PoseFrame): PoseResult | null {
-    const person = this.pickPerson(frame);
-    if (!person) return null;
-
-    const filtered: PoseKeypoint[] = person.keypoints.map((kp) => {
-      const f = this.getFilter(kp.name);
-      if (!f) {
-        return kp;
-      }
-      const sm = f.next(kp.x, kp.y, frame.ts);
-      return {
-        ...kp,
-        x: sm.x,
-        y: sm.y,
-      };
+      const smoothed = this.smoothers[id].filter(kp.x, kp.y, tSec);
+      return { ...kp, x: smoothed.x, y: smoothed.y };
     });
 
     return {
-      keypoints: filtered,
+      ...best,
+      keypoints,
       ts: frame.ts,
     };
   }
