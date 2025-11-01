@@ -1,73 +1,103 @@
 // lib/pose/poseEngine.ts
-// 统一的姿态结果结构 + 选人 + 平滑
-// 给已有的 lib/analyze/*.ts 用的
+// 作用：
+// 1. 外面塞进来一帧“可能有多个人”的姿态
+// 2. 我们挑出那个最像前景投篮的人
+// 3. 给每个关键点做 OneEuro 平滑
+// 4. 统一成我们前端画布好画的格式
 
-import { OneEuro2D, OneEuroConfig } from './oneEuro2d';
+import { OneEuro2D, type OneEuroConfig, makeDefaultOneEuro } from './oneEuro2d';
 
 export type PoseKeypoint = {
   name: string;
-  x: number;
+  x: number; // 绝对像素坐标
   y: number;
+  z?: number;
   score?: number;
 };
 
-export type PoseResult = {
+export type RawPerson = {
+  id?: string;
+  score?: number;
   keypoints: PoseKeypoint[];
-  box?: { x: number; y: number; width: number; height: number };
-  score?: number;
-  ts?: number;
 };
 
-export type MultiPersonFrame = {
-  persons: PoseResult[];
+export type PoseFrame = {
+  persons: RawPerson[];
   ts: number; // ms
 };
 
-type EngineOpts = {
-  smooth?: Partial<OneEuroConfig>;
+export type PoseResult = {
+  id: string;
+  keypoints: PoseKeypoint[];
+  score: number;
+};
+
+type PoseEngineOpts = {
+  smooth?: OneEuroConfig;
+  minScore?: number;
 };
 
 export class PoseEngine {
-  private smoothers: Record<string, OneEuro2D> = {};
-  private smoothCfg: OneEuroConfig;
+  private readonly opts: Required<PoseEngineOpts>;
+  private readonly filters = new Map<string, OneEuro2D>();
 
-  constructor(opts?: EngineOpts) {
-    this.smoothCfg = {
-      minCutoff: 1.15,
-      beta: 0.05,
-      dCutoff: 1.0,
-      ...(opts?.smooth ?? {}),
+  constructor(opts: PoseEngineOpts = {}) {
+    this.opts = {
+      smooth: opts.smooth ?? makeDefaultOneEuro(),
+      minScore: opts.minScore ?? 0.2,
     };
   }
 
-  // 只要一个人：选得分最高的那个人 + 平滑
-  process(frame: MultiPersonFrame): PoseResult | null {
-    if (!frame.persons || frame.persons.length === 0) return null;
+  private pickMainPerson(persons: RawPerson[]): RawPerson | null {
+    if (!persons.length) return null;
+    // 1. 按 score 排
+    const withScore = [...persons].sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
+    const best = withScore[0];
+    if ((best.score ?? 0) >= this.opts.minScore) {
+      return best;
+    }
+    // 2. 没有 score 的场景下，用“有没有肩膀+胯”来判
+    const hasCore = (p: RawPerson) => {
+      const names = p.keypoints.map((k) => k.name);
+      return (
+        names.includes('left_shoulder') ||
+        names.includes('right_shoulder') ||
+        names.includes('left_hip') ||
+        names.includes('right_hip')
+      );
+    };
+    const candidate = withScore.find(hasCore);
+    return candidate ?? best;
+  }
 
-    const best = [...frame.persons]
-      .map((p) => ({
-        p,
-        sc:
-          p.score ??
-          p.keypoints.reduce((s, k) => s + (k.score ?? 0), 0) / Math.max(p.keypoints.length, 1),
-      }))
-      .sort((a, b) => b.sc - a.sc)[0].p;
+  private getFilter(name: string) {
+    let f = this.filters.get(name);
+    if (!f) {
+      f = new OneEuro2D(this.opts.smooth);
+      this.filters.set(name, f);
+    }
+    return f;
+  }
 
-    const tSec = frame.ts / 1000;
+  process(frame: PoseFrame): PoseResult | null {
+    const p = this.pickMainPerson(frame.persons);
+    if (!p) return null;
 
-    const keypoints = best.keypoints.map((kp) => {
-      const id = kp.name;
-      if (!this.smoothers[id]) {
-        this.smoothers[id] = new OneEuro2D(this.smoothCfg);
-      }
-      const smoothed = this.smoothers[id].filter(kp.x, kp.y, tSec);
-      return { ...kp, x: smoothed.x, y: smoothed.y };
+    const t = frame.ts / 1000; // 内部用秒
+    const smoothed: PoseKeypoint[] = p.keypoints.map((kp) => {
+      const f = this.getFilter(kp.name);
+      const { x, y } = f.filter({ x: kp.x, y: kp.y }, t);
+      return {
+        ...kp,
+        x,
+        y,
+      };
     });
 
     return {
-      ...best,
-      keypoints,
-      ts: frame.ts,
+      id: p.id ?? 'main',
+      keypoints: smoothed,
+      score: p.score ?? 1,
     };
   }
 }
