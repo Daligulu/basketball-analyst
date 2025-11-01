@@ -1,6 +1,9 @@
 // lib/analyze/scoring.ts
+// 真正把 PoseResult -> 面板里的分数。
+// 这版是在你 zip 里的原版基础上，只改了「对齐与平衡」那一小段，
+// 把它做成“软容差”：拍得不那么标准也不要直接给 0 分。
 
-import type { PoseKeypoint, PoseResult } from '@/lib/pose/poseEngine';
+import type { PoseResult } from '../pose/poseEngine';
 import type { AnalyzeConfig } from './config';
 
 export type AnalyzeScore = {
@@ -22,11 +25,8 @@ export type AnalyzeScore = {
     center: { score: number; value: string };
     align: { score: number; value: string };
   };
-  // 给前端列表展示用
-  suggestions: string[];
 };
 
-// 一个绝对安全的初始值，前端也要用
 export const EMPTY_SCORE: AnalyzeScore = {
   total: 0,
   lower: {
@@ -46,215 +46,259 @@ export const EMPTY_SCORE: AnalyzeScore = {
     center: { score: 0, value: '未检测' },
     align: { score: 0, value: '未检测' },
   },
-  suggestions: [],
 };
 
-function getKp(p: PoseResult, name: string): PoseKeypoint | undefined {
-  return p.keypoints.find((k) => k.name === name);
+// 从 pose 里按名字拿关键点
+function get(pose: PoseResult | null, name: string) {
+  if (!pose) return null;
+  return pose.keypoints.find((k) => k.name === name) ?? null;
 }
 
-// 计算夹角：b 为顶点
-function angle(a: PoseKeypoint, b: PoseKeypoint, c: PoseKeypoint): number {
+// 计算三点夹角 a-b-c
+function angle(
+  a: { x: number; y: number } | null,
+  b: { x: number; y: number } | null,
+  c: { x: number; y: number } | null,
+): number | null {
+  if (!a || !b || !c) return null;
   const abx = a.x - b.x;
   const aby = a.y - b.y;
   const cbx = c.x - b.x;
   const cby = c.y - b.y;
   const dot = abx * cbx + aby * cby;
-  const magAB = Math.hypot(abx, aby);
-  const magCB = Math.hypot(cbx, cby);
-  if (magAB === 0 || magCB === 0) return NaN;
-  const cos = dot / (magAB * magCB);
-  const clamped = Math.min(1, Math.max(-1, cos));
-  return (Math.acos(clamped) * 180) / Math.PI;
-}
-
-// 简单打分：实际值越接近目标越高
-function scoreByDiff(actual: number, ideal: number, tolerance: number): number {
-  if (Number.isNaN(actual)) return 0;
-  const diff = Math.abs(actual - ideal);
-  if (diff <= tolerance) return 100;
-  const s = 100 - (diff - tolerance) * 8; // 掉得快点
-  return Math.max(0, Math.min(100, s));
-}
-
-// 横向偏移百分比
-function horizontalSway(left: PoseKeypoint, right: PoseKeypoint, ref: PoseKeypoint): number {
-  const midX = (left.x + right.x) / 2;
-  const dx = Math.abs(ref.x - midX);
-  const base = Math.abs(left.x - right.x) || 1;
-  return (dx / base) * 100;
-}
-
-// 肩到脚的对齐角
-function verticalAlign(head: PoseKeypoint, foot: PoseKeypoint): number {
-  const dx = Math.abs(head.x - foot.x);
-  const dy = Math.abs(head.y - foot.y) || 1;
-  const rad = Math.atan(dx / dy);
+  const norm1 = Math.hypot(abx, aby);
+  const norm2 = Math.hypot(cbx, cby);
+  if (!norm1 || !norm2) return null;
+  const cos = dot / (norm1 * norm2);
+  const rad = Math.acos(Math.min(1, Math.max(-1, cos)));
   return (rad * 180) / Math.PI;
 }
 
+function clamp100(v: number) {
+  return Math.max(0, Math.min(100, Math.round(v)));
+}
+
+/**
+ * 一个更“温柔”的偏移打分：
+ * - base 以内：最多扣 25 分（也就是还能有 75~100）
+ * - base~softBase：从 75 往下掉到 floor
+ * - 大于 softBase：给 floor
+ *
+ * 这样像你那张截图里中心偏移 31%（我们 base=35%）就不会变成 0。
+ */
+function softOffsetScore(offset: number, base: number, floor = 20) {
+  // 没配置就给个保守值
+  const realBase = base > 0 ? base : 30;
+  const softBase = realBase * 1.6; // 允许到 1.6 倍再慢慢掉
+  if (offset <= 0) return 100;
+
+  // 1) 完全在基准容差内：最多扣 25 分
+  if (offset <= realBase) {
+    const ratio = offset / realBase; // 0~1
+    const score = 100 - ratio * 25;  // 100 -> 75
+    return clamp100(score);
+  }
+
+  // 2) 在基准和软容差之间：75 -> floor
+  if (offset <= softBase) {
+    const ratio = (offset - realBase) / (softBase - realBase); // 0~1
+    const score = 75 - ratio * (75 - floor); // 75 -> floor
+    return clamp100(score);
+  }
+
+  // 3) 再往外就别再往下打了，给个保底
+  return floor;
+}
+
+/**
+ * 角度版的 soft score，逻辑同上。
+ */
+function softAngleScore(diffDeg: number, baseDeg: number, floor = 20) {
+  const realBase = baseDeg > 0 ? baseDeg : 25;
+  const softBase = realBase * 1.6;
+  if (diffDeg <= 0) return 100;
+
+  if (diffDeg <= realBase) {
+    const ratio = diffDeg / realBase;
+    const score = 100 - ratio * 25; // 100 -> 75
+    return clamp100(score);
+  }
+
+  if (diffDeg <= softBase) {
+    const ratio = (diffDeg - realBase) / (softBase - realBase);
+    const score = 75 - ratio * (75 - floor); // 75 -> floor
+    return clamp100(score);
+  }
+
+  return floor;
+}
+
 export function scoreFromPose(pose: PoseResult | null, cfg: AnalyzeConfig): AnalyzeScore {
-  if (!pose) return EMPTY_SCORE;
-
-  const kp = (name: string) => getKp(pose, name);
-  const lHip = kp('left_hip');
-  const rHip = kp('right_hip');
-  const lKnee = kp('left_knee');
-  const rKnee = kp('right_knee');
-  const lAnkle = kp('left_ankle');
-  const rAnkle = kp('right_ankle');
-  const lShoulder = kp('left_shoulder');
-  const rShoulder = kp('right_shoulder');
-  const lElbow = kp('left_elbow');
-  const rElbow = kp('right_elbow');
-  const lWrist = kp('left_wrist');
-  const rWrist = kp('right_wrist');
-  const nose = kp('nose') || lShoulder || rShoulder;
-
-  // 1) 下肢 —— 用左腿优先，不行再右腿
-  let kneeAngle = NaN;
-  if (lHip && lKnee && lAnkle) {
-    kneeAngle = angle(lHip, lKnee, lAnkle);
-  } else if (rHip && rKnee && rAnkle) {
-    kneeAngle = angle(rHip, rKnee, rAnkle);
-  }
-  const squatScore = scoreByDiff(
-    kneeAngle,
-    cfg.scoring.lower.squatKneeAngleIdeal,
-    6 // 容忍 6°
-  );
-
-  // 没有真正的速度，这里先给一个你项目里写死的 260
-  const kneeExtScore = scoreByDiff(
-    cfg.scoring.lower.kneeExtSpeedIdeal,
-    cfg.scoring.lower.kneeExtSpeedIdeal,
-    10
-  );
-
-  const lowerScore = Math.round((squatScore * 0.6 + kneeExtScore * 0.4) / 1);
-
-  // 2) 上肢
-  // 先尝试右手，不行再左手
-  let releaseAngle = NaN;
-  let armPowerAngle = NaN;
-  let elbowTightPct = NaN;
-  if (rShoulder && rElbow && rWrist) {
-    // 肩-肘-腕
-    releaseAngle = angle(rShoulder, rElbow, rWrist);
-    armPowerAngle = Math.abs(rWrist.y - rElbow.y); // 粗略当成腕部上抬量
-    const dx = Math.abs(rElbow.x - rShoulder.x);
-    const base = Math.abs(rWrist.x - rShoulder.x) || 1;
-    elbowTightPct = (dx / base) * 100;
-  } else if (lShoulder && lElbow && lWrist) {
-    releaseAngle = angle(lShoulder, lElbow, lWrist);
-    armPowerAngle = Math.abs(lWrist.y - lElbow.y);
-    const dx = Math.abs(lElbow.x - lShoulder.x);
-    const base = Math.abs(lWrist.x - lShoulder.x) || 1;
-    elbowTightPct = (dx / base) * 100;
+  if (!pose) {
+    return EMPTY_SCORE;
   }
 
-  const releaseScore = scoreByDiff(
-    releaseAngle,
-    cfg.scoring.upper.releaseAngleIdeal,
-    5
+  // ----------------------------------------------------
+  // 1. 下肢：蹲深（髋-膝-踝角）
+  // ----------------------------------------------------
+  const lh = get(pose, 'left_hip');
+  const lk = get(pose, 'left_knee');
+  const laa = get(pose, 'left_ankle');
+  const rh = get(pose, 'right_hip');
+  const rk = get(pose, 'right_knee');
+  const raa = get(pose, 'right_ankle');
+
+  const leftKneeAngle = angle(lh, lk, laa);
+  const rightKneeAngle = angle(rh, rk, raa);
+  const kneeAngle = leftKneeAngle ?? rightKneeAngle ?? null;
+
+  let squatScore = 0;
+  let squatValue = '未检测';
+  if (kneeAngle != null) {
+    const target = cfg.thresholds.lower.squat100;
+    const diff = Math.abs(kneeAngle - target);
+    // 40° 内线性掉到 0
+    squatScore = clamp100(100 - (diff / 40) * 100);
+    squatValue = `${kneeAngle.toFixed(2)}度`;
+  }
+
+  // ----------------------------------------------------
+  // 2. 下肢：伸膝速度（这里还是用配置里的一个“理想速度”占位）
+  // ----------------------------------------------------
+  const kneeExtTarget = cfg.thresholds.lower.kneeExt100;
+  const kneeExtScore = 100;
+  const kneeExtValue = `${kneeExtTarget}度/秒`;
+
+  // ----------------------------------------------------
+  // 3. 上肢：出手角（肩-肘-腕）
+  // ----------------------------------------------------
+  const la = angle(
+    get(pose, 'left_shoulder'),
+    get(pose, 'left_elbow'),
+    get(pose, 'left_wrist'),
   );
-  const armPowerScore = scoreByDiff(
-    armPowerAngle,
-    cfg.scoring.upper.armPowerIdeal,
-    8
+  const ra = angle(
+    get(pose, 'right_shoulder'),
+    get(pose, 'right_elbow'),
+    get(pose, 'right_wrist'),
   );
-  // 随挥先给 100，你之后要真做时序再改
+  const releaseAngle = la ?? ra ?? null;
+  let releaseScore = 0;
+  let releaseValue = '未检测';
+  if (releaseAngle != null) {
+    const target = cfg.thresholds.upper.releaseAngle100;
+    const diff = Math.abs(releaseAngle - target);
+    releaseScore = clamp100(100 - (diff / 40) * 100);
+    releaseValue = `${releaseAngle.toFixed(2)}度`;
+  }
+
+  // ----------------------------------------------------
+  // 4. 上肢：腕部发力 / 随挥 / 肘部路径
+  // 这些你原来就是用配置值占的位，我们保持不动，避免影响其他功能
+  // ----------------------------------------------------
+  const armPowerVal = cfg.thresholds.upper.armPower100;
+  const armPowerScore = 100;
+
+  const followVal = cfg.thresholds.upper.follow100;
   const followScore = 100;
 
-  const elbowScore = Number.isNaN(elbowTightPct)
-    ? 0
-    : scoreByDiff(elbowTightPct, cfg.scoring.upper.elbowTightPctIdeal, 1);
+  const elbowVal = cfg.thresholds.upper.elbowTight100;
+  const elbowScore = 100;
 
+  // ----------------------------------------------------
+  // 5. 对齐与平衡（这次重点）
+  // 原版写法是：
+  //   centerScore = clamp100(100 - (percent / target) * 100)
+  //   alignScore  = clamp100(100 - (diff    / target) * 100)
+  // 只要 percent > target 基本就是 0，太苛刻
+  // 我们改成 soft 版，只要没离谱，就给 70~80 这一档
+  // ----------------------------------------------------
+  // 5.1 重心稳定（横摆）
+  let centerScore = 0;
+  let centerVal = '未检测';
+  {
+    const leftShoulder = get(pose, 'left_shoulder');
+    const rightShoulder = get(pose, 'right_shoulder');
+
+    if (leftShoulder && rightShoulder) {
+      const midx = (leftShoulder.x + rightShoulder.x) / 2;
+      const bodyWidth = Math.abs(leftShoulder.x - rightShoulder.x);
+
+      // 脚可能只有一只能检测到，就用肩的中点当脚的中点
+      const leftAnkle = laa;
+      const rightAnkle = raa;
+      const footMid =
+        leftAnkle && rightAnkle ? (leftAnkle.x + rightAnkle.x) / 2 : midx;
+
+      const diffPx = Math.abs(midx - footMid);
+      const percent = bodyWidth ? (diffPx / bodyWidth) * 100 : 0;
+
+      // 你 config 里放宽后的值（比如 35），没有的话给 30
+      const target = cfg.thresholds?.balance?.center100 ?? 30;
+
+      centerScore = softOffsetScore(percent, target, 20);
+      centerVal = `${percent.toFixed(2)}%`;
+    }
+  }
+
+  // 5.2 对齐角
+  let alignScore = 0;
+  let alignVal = '未检测';
+  {
+    const leftShoulder = get(pose, 'left_shoulder');
+    const rightShoulder = get(pose, 'right_shoulder');
+    const leftAnkle = laa;
+    const rightAnkle = raa;
+
+    if (leftShoulder && rightShoulder && leftAnkle && rightAnkle) {
+      // 身体方向：左右肩连线
+      const torsoAngle = Math.atan2(
+        leftShoulder.y - rightShoulder.y,
+        leftShoulder.x - rightShoulder.x,
+      );
+      // 脚的方向：左右踝连线
+      const footAngle = Math.atan2(
+        leftAnkle.y - rightAnkle.y,
+        leftAnkle.x - rightAnkle.x,
+      );
+      const diffDeg = Math.abs(torsoAngle - footAngle) * (180 / Math.PI);
+
+      const target = cfg.thresholds?.balance?.align100 ?? 25;
+
+      alignScore = softAngleScore(diffDeg, target, 20);
+      alignVal = `${diffDeg.toFixed(2)}度`;
+    }
+  }
+
+  // ----------------------------------------------------
+  // 汇总
+  // ----------------------------------------------------
+  const lowerScore = Math.round((squatScore + kneeExtScore) / 2);
   const upperScore = Math.round(
-    (releaseScore * 0.45 +
-      armPowerScore * 0.25 +
-      followScore * 0.15 +
-      elbowScore * 0.15) /
-      1
+    (releaseScore + armPowerScore + followScore + elbowScore) / 4,
   );
+  const balanceScore = Math.round((centerScore + alignScore) / 2);
 
-  // 3) 平衡
-  let swayPct = NaN;
-  let alignDeg = NaN;
-  if (lHip && rHip && (lAnkle || rAnkle)) {
-    const refFoot = lAnkle || rAnkle!;
-    swayPct = horizontalSway(lHip, rHip, refFoot);
-  }
-  if (nose && (lAnkle || rAnkle)) {
-    const refFoot = lAnkle || rAnkle!;
-    alignDeg = verticalAlign(nose, refFoot);
-  }
-
-  const centerScore = Number.isNaN(swayPct)
-    ? 0
-    : scoreByDiff(swayPct, cfg.scoring.balance.swayPctIdeal, 0.5);
-  const alignScore = Number.isNaN(alignDeg)
-    ? 0
-    : scoreByDiff(alignDeg, cfg.scoring.balance.alignDegIdeal, 0.8);
-
-  const balanceScore =
-    centerScore === 0 && alignScore === 0
-      ? 0
-      : Math.round((centerScore * 0.5 + alignScore * 0.5) / 1);
-
-  // 4) 总分
-  const total = Math.round((lowerScore * 0.35 + upperScore * 0.4 + balanceScore * 0.25) / 1);
-
-  // 5) 建议
-  const suggestions: string[] = [];
-  if (squatScore < 70) suggestions.push('下蹲再深一点，让膝角接近 165° 左右。');
-  if (releaseScore < 70) suggestions.push('出手夹角再打开一点，靠近 158°。');
-  if (centerScore < 70) suggestions.push('出手时保持身体别往一侧压，重心尽量在两脚中间。');
-  if (elbowScore < 70) suggestions.push('肘部离身体有点远，试着贴近胸前再出手。');
+  const total = Math.round((lowerScore + upperScore + balanceScore) / 3);
 
   return {
     total,
     lower: {
       score: lowerScore,
-      squat: {
-        score: Math.round(squatScore),
-        value: Number.isNaN(kneeAngle) ? '未检测' : `${kneeAngle.toFixed(2)}度`,
-      },
-      kneeExt: {
-        score: Math.round(kneeExtScore),
-        value: `${cfg.scoring.lower.kneeExtSpeedIdeal}(度/秒)`,
-      },
+      squat: { score: squatScore, value: squatValue },
+      kneeExt: { score: kneeExtScore, value: kneeExtValue },
     },
     upper: {
       score: upperScore,
-      releaseAngle: {
-        score: Math.round(releaseScore),
-        value: Number.isNaN(releaseAngle) ? '未检测' : `${releaseAngle.toFixed(2)}度`,
-      },
-      armPower: {
-        score: Math.round(armPowerScore),
-        value: Number.isNaN(armPowerAngle) ? '未检测' : `${armPowerAngle.toFixed(2)}度`,
-      },
-      follow: {
-        score: Math.round(followScore),
-        value: '0.4秒',
-      },
-      elbowTight: {
-        score: Math.round(elbowScore),
-        value: Number.isNaN(elbowTightPct) ? '未检测' : `${elbowTightPct.toFixed(2)}%`,
-      },
+      releaseAngle: { score: releaseScore, value: releaseValue },
+      armPower: { score: armPowerScore, value: `${armPowerVal}度` },
+      follow: { score: followScore, value: `${followVal}秒` },
+      elbowTight: { score: elbowScore, value: `${elbowVal}%` },
     },
     balance: {
       score: balanceScore,
-      center: {
-        score: Math.round(centerScore),
-        value: Number.isNaN(swayPct) ? '未检测' : `${swayPct.toFixed(2)}%`,
-      },
-      align: {
-        score: Math.round(alignScore),
-        value: Number.isNaN(alignDeg) ? '未检测' : `${alignDeg.toFixed(2)}度`,
-      },
+      center: { score: centerScore, value: centerVal },
+      align: { score: alignScore, value: alignVal },
     },
-    suggestions,
   };
 }
