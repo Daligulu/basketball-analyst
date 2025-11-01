@@ -18,20 +18,18 @@ import {
   LOWER_COLOR,
 } from '@/lib/pose/skeleton';
 
-// 这几个全局名字是 MediaPipe pose.js 加载之后挂到 window 上的
 type MPose = any;
 
-const MP_LOCAL_BASES = [
-  // 尝试本地静态资源，用户可以把 @mediapipe/pose 里的文件丢到 public/mediapipe/pose 下
-  '/mediapipe/pose',
-  '/pose',
-];
-
+const MP_LOCAL_BASES = ['/mediapipe/pose', '/pose'];
 const MP_CDN_BASE = 'https://cdn.jsdelivr.net/npm/@mediapipe/pose@0.5';
 
 async function loadScriptOnce(src: string) {
   return new Promise<void>((resolve, reject) => {
-    // 已经有了就别再加
+    if (typeof document === 'undefined') {
+      reject(new Error('no document'));
+      return;
+    }
+    // 已经加载过了就不再加载
     if (document.querySelector(`script[data-src="${src}"]`)) {
       resolve();
       return;
@@ -46,29 +44,28 @@ async function loadScriptOnce(src: string) {
   });
 }
 
-// 先走本地，再走 CDN
+// 尝试本地 → 不行再 CDN
 async function ensureMediapipePoseLoaded(): Promise<boolean> {
   if (typeof window === 'undefined') return false;
   if ((window as any).Pose) return true;
 
+  // 本地尝试
   for (const base of MP_LOCAL_BASES) {
     try {
       await loadScriptOnce(`${base}/pose.js`);
       if ((window as any).Pose) return true;
     } catch {
-      // ignore
+      // 忽略，继续下一条
     }
   }
 
-  // 本地都没有，再用 CDN
+  // CDN 兜底
   try {
     await loadScriptOnce(`${MP_CDN_BASE}/pose.js`);
-    if ((window as any).Pose) return true;
-  } catch (err) {
-    console.warn('mediapipe pose cdn load failed', err);
+    return !!(window as any).Pose;
+  } catch {
+    return false;
   }
-
-  return !!(window as any).Pose;
 }
 
 export default function VideoAnalyzer() {
@@ -87,7 +84,7 @@ export default function VideoAnalyzer() {
   const [showConfig, setShowConfig] = useState(false);
   const [videoSize, setVideoSize] = useState<{ w: number; h: number }>({ w: 0, h: 0 });
 
-  // init pose engine (只做平滑/主目标选择)
+  // 初始化平滑引擎
   useEffect(() => {
     engineRef.current = new PoseEngine({
       smooth: {
@@ -97,33 +94,37 @@ export default function VideoAnalyzer() {
       },
       minScore: cfg.pose.kpMinScore,
     });
-  }, [cfg.pose.smoothBeta, cfg.pose.smoothMinCutoff, cfg.pose.kpMinScore]);
+  }, [cfg.pose.smoothMinCutoff, cfg.pose.smoothBeta, cfg.pose.kpMinScore]);
 
-  // 页面一挂载就先把 mediapipe 加载了
+  // 页面加载时就先把 mediapipe 拉起来
   useEffect(() => {
-    let stop = false;
+    let stopped = false;
     (async () => {
       if (typeof window === 'undefined') return;
+
       const ok = await ensureMediapipePoseLoaded();
-      if (stop) return;
+      if (stopped) return;
+
       if (!ok) {
-        console.warn('mediapipe pose not loaded');
         setPoseReady(false);
         return;
       }
+
       const PoseCtor = (window as any).Pose as any;
       const pose = new PoseCtor({
         locateFile: (file: string) => {
-          // 优先走本地
-          for (const base of MP_LOCAL_BASES) {
-            // @ts-expect-error
-            if (typeof window !== 'undefined') {
+          // 优先走本地路径
+          if (typeof window !== 'undefined') {
+            for (const base of MP_LOCAL_BASES) {
+              // 这里不需要 @ts-expect-error，因为 window 已经判断过
               return `${base}/${file}`;
             }
           }
+          // 兜底走 CDN
           return `${MP_CDN_BASE}/${file}`;
         },
       });
+
       pose.setOptions({
         modelComplexity: cfg.pose.modelComplexity === 'lite' ? 0 : 1,
         smoothLandmarks: true,
@@ -131,16 +132,17 @@ export default function VideoAnalyzer() {
         minDetectionConfidence: 0.5,
         minTrackingConfidence: 0.5,
       });
+
       pose.onResults((res: any) => {
         const poseLandmarks = res.poseLandmarks as Array<any> | undefined;
-        if (!poseLandmarks || !engineRef.current || !videoRef.current || !canvasRef.current)
+        if (!poseLandmarks || !engineRef.current || !videoRef.current || !canvasRef.current) {
           return;
+        }
 
         const persons = [
           {
             score: 1,
             keypoints: poseLandmarks.map((lm, idx) => {
-              // Mediapipe 33 点
               const names = [
                 'nose',
                 'left_eye_inner',
@@ -179,7 +181,6 @@ export default function VideoAnalyzer() {
 
               const name = names[idx] ?? `kp_${idx}`;
               const v = videoRef.current!;
-              // lm.x/y 是 0~1，这里转成像素
               const x = lm.x * v.videoWidth;
               const y = lm.y * v.videoHeight;
               return {
@@ -202,12 +203,13 @@ export default function VideoAnalyzer() {
         drawPoseOnCanvas(person, cfg);
         setScores(scoreFromPose(person, cfg));
       });
+
       mpPoseRef.current = pose;
       setPoseReady(true);
     })();
 
     return () => {
-      stop = true;
+      stopped = true;
     };
   }, [cfg]);
 
@@ -217,14 +219,14 @@ export default function VideoAnalyzer() {
     if (!cvs || !vid) return;
     const ctx = cvs.getContext('2d');
     if (!ctx) return;
-    ctx.clearRect(0, 0, cvs.width, cvs.height);
 
+    ctx.clearRect(0, 0, cvs.width, cvs.height);
     if (!person) return;
 
     const minScore = curCfg.pose.kpMinScore;
     const r = 3;
 
-    // draw points
+    // 画点
     for (const kp of person.keypoints) {
       if ((kp.score ?? 0) < minScore) continue;
       let color = UPPER_COLOR;
@@ -247,13 +249,14 @@ export default function VideoAnalyzer() {
       ) {
         color = LOWER_COLOR;
       }
+
       ctx.fillStyle = color;
       ctx.beginPath();
       ctx.arc(kp.x, kp.y, r, 0, Math.PI * 2);
       ctx.fill();
     }
 
-    // draw lines
+    // 画骨架
     for (const { pair, color } of ALL_CONNECTIONS) {
       const [aName, bName] = pair;
       const a = person.keypoints.find((k) => k.name === aName);
@@ -262,6 +265,7 @@ export default function VideoAnalyzer() {
       if ((a.score ?? 0) < minScore || (b.score ?? 0) < minScore) continue;
       const dist = Math.hypot(a.x - b.x, a.y - b.y);
       if (dist > Math.min(cvs.width, cvs.height) * 0.7) continue;
+
       ctx.strokeStyle = color;
       ctx.lineWidth = 2;
       ctx.beginPath();
@@ -295,7 +299,6 @@ export default function VideoAnalyzer() {
     const pose = mpPoseRef.current;
     if (!vid || !pose) return;
     if (vid.paused || vid.ended) return;
-
     await pose.send({ image: vid });
     requestAnimationFrame(analyzeLoop);
   }, []);
@@ -303,8 +306,7 @@ export default function VideoAnalyzer() {
   const handleStart = async () => {
     if (!videoRef.current) return;
     if (!poseReady) {
-      // 不再 alert，而是给个轻提示
-      alert('模型正在初始化，请 1 秒后再点一次（建议把 /public/mediapipe/pose 上传到 Vercel，可以更快）');
+      alert('Mediapipe Pose 还没加载好，1 秒后再点一次；也可以把 /public/mediapipe/pose 放上去会更快。');
       return;
     }
     setIsAnalyzing(true);
@@ -313,11 +315,9 @@ export default function VideoAnalyzer() {
     requestAnimationFrame(analyzeLoop);
   };
 
-  // 配置修改
   const updateCfg = (next: AnalyzeConfig) => {
     setCfg(next);
     saveAnalyzeConfig(next);
-    // 配置一改，马上用最新配置再算一遍
     setScores(scoreFromPose(lastPoseRef.current, next));
   };
 
@@ -360,7 +360,7 @@ export default function VideoAnalyzer() {
         </button>
       </div>
 
-      {/* 视频区域 */}
+      {/* 视频 */}
       <div
         className="relative bg-black rounded-lg overflow-hidden"
         style={{
@@ -563,6 +563,7 @@ export default function VideoAnalyzer() {
             </div>
           </div>
 
+          {/* 评分项 */}
           <div className="text-slate-300 text-xs mt-2">评分 100 分对应值</div>
           <div className="grid grid-cols-2 gap-3 text-xs text-slate-100">
             {/* 下肢 */}
