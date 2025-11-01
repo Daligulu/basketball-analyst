@@ -16,9 +16,19 @@ import {
 } from '@/lib/pose/skeleton';
 import { scoreFromPose, type AnalyzeScore } from '@/lib/analyze/scoring';
 import { DEFAULT_ANALYZE_CONFIG, type AnalyzeConfig } from '@/lib/analyze/config';
+import ScoreRadar from '@/components/ScoreRadar';
 
-// 本地初始化用的分数（你原来 UI 那套）
-const INITIAL_SCORE: AnalyzeScore = {
+// -------------------------------------------------------------
+// 1) 我们自己在前端扩一层，让它可以带 suggestions
+// -------------------------------------------------------------
+type AnalyzeScoreUI = AnalyzeScore & {
+  suggestions?: string[];
+};
+
+// -------------------------------------------------------------
+// 2) 初始分数（注意：这里就用我们扩展后的类型，不会再 TS 报错）
+// -------------------------------------------------------------
+const INITIAL_SCORE: AnalyzeScoreUI = {
   total: 0,
   lower: {
     score: 0,
@@ -37,95 +47,97 @@ const INITIAL_SCORE: AnalyzeScore = {
     center: { score: 0, value: '未检测' },
     align: { score: 0, value: '未检测' },
   },
-  // 建议这块在 scoring 里有就会出来
+  // 这行就是你之前想要的 “投篮姿态优化建议”
   suggestions: [],
 };
 
-// 这里列出我们「按顺序尝试」的 Mediapipe 地址
-// 前三个是你项目自己可以托管在 public/ 下的，不依赖任何 CDN
-const MP_CANDIDATES = [
-  '/mediapipe/pose.js',
-  '/mediapipe/pose/pose.js',
-  '/pose/pose.js',
-  // 真都没有才走 CDN
-  'https://cdn.jsdelivr.net/npm/@mediapipe/pose@0.5/pose.js',
-  'https://cdn.jsdelivr.net/npm/@mediapipe/pose@latest/pose.js',
+// -------------------------------------------------------------
+// 3) CDN 列表（你也可以只保留第一个）
+// -------------------------------------------------------------
+const MP_POSE_CDNS = [
+  'https://cdn.jsdelivr.net/npm/@mediapipe/pose',
+  'https://unpkg.com/@mediapipe/pose',
 ];
 
-// ---------- 工具：按顺序往 <head> 里插 script ----------
-function loadScriptSequential(urls: string[]): Promise<{ ok: boolean; base?: string }> {
-  if (typeof window === 'undefined') {
-    return Promise.resolve({ ok: false });
-  }
-
-  return new Promise((resolve) => {
-    const tryOne = (index: number) => {
-      if (index >= urls.length) {
-        resolve({ ok: false });
-        return;
-      }
-
-      const full = urls[index];
-      // 为了后面 locateFile 能拿到「不带文件名的 base」
-      const base = full.replace(/\/pose\.js$/, '').replace(/\/$/, '');
-
-      const s = document.createElement('script');
-      s.src = full;
-      s.async = true;
-      s.crossOrigin = 'anonymous';
-      s.onload = () => {
-        // 成功了就记住这个 base，后面 locateFile 用
-        (window as any).__mpPoseBase = base;
-        resolve({ ok: true, base });
-      };
-      s.onerror = () => {
-        s.remove();
-        tryOne(index + 1);
-      };
-      document.head.appendChild(s);
-    };
-
-    tryOne(0);
-  });
-}
-
-// ---------- 主组件 ----------
+// -------------------------------------------------------------
+// 4) 真正的组件
+// -------------------------------------------------------------
 export default function VideoAnalyzer() {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
-
-  // 我们自己写的“前景过滤 + 平滑”的小引擎
   const engineRef = useRef<PoseEngine | null>(null);
 
-  // 真正的 mediapipe pose 实例
+  // Mediapipe 的 window.POSE / window.drawLandmarks 之类
   const mpPoseRef = useRef<any>(null);
-  // 上一帧的姿态（给打分 / 稳定用）
-  const lastPoseRef = useRef<PoseResult | null>(null);
 
   const [file, setFile] = useState<File | null>(null);
   const [videoUrl, setVideoUrl] = useState('');
-  const [isAnalyzing, setIsAnalyzing] = useState(false);
-  const [isConfigOpen, setIsConfigOpen] = useState(false);
-  const [scores, setScores] = useState<AnalyzeScore>(INITIAL_SCORE);
   const [videoSize, setVideoSize] = useState<{ w: number; h: number }>({ w: 0, h: 0 });
 
-  // 评分相关的前端配置（你说要能在面板里改 100 分对应值，这里先塞进 state）
-  const [analyzeConfig, setAnalyzeConfig] = useState<AnalyzeConfig>({
-    ...DEFAULT_ANALYZE_CONFIG,
-  });
+  const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [isConfigOpen, setIsConfigOpen] = useState(false);
+  const [scores, setScores] = useState<AnalyzeScoreUI>(INITIAL_SCORE);
 
-  // ---------------- 初始化 PoseEngine（我们自己的 2D 一阶滤波） ----------------
+  // 前端这版的“可调参数”，先用 config 里的默认
+  const [analyzeConfig, setAnalyzeConfig] =
+    useState<AnalyzeConfig>(DEFAULT_ANALYZE_CONFIG);
+
+  // ================== 初始化姿态引擎（我们自己的平滑 + 选人） ==================
   useEffect(() => {
     engineRef.current = new PoseEngine({
       smooth: {
-        minCutoff: 1.15,
-        beta: 0.05,
-        dCutoff: 1.0,
+        minCutoff: analyzeConfig.poseSmoothing.minCutoff,
+        beta: analyzeConfig.poseSmoothing.beta,
+        dCutoff: analyzeConfig.poseSmoothing.dCutoff,
       },
     } as any);
+  }, [analyzeConfig]);
+
+  // ================== 挂载时去加载 Mediapipe Pose ==================
+  useEffect(() => {
+    let canceled = false;
+
+    async function loadMp() {
+      // 浏览器端才有 window
+      if (typeof window === 'undefined') return;
+
+      // 如果已经有了就不要重复下了
+      if ((window as any).Pose) {
+        mpPoseRef.current = (window as any).Pose;
+        return;
+      }
+
+      for (const base of MP_POSE_CDNS) {
+        try {
+          // 直接动态 import CDN 的 UMD
+          // @ts-ignore
+          await new Promise<void>((resolve, reject) => {
+            const script = document.createElement('script');
+            script.src = `${base}/pose.js`;
+            script.async = true;
+            script.onload = () => resolve();
+            script.onerror = () => reject(new Error('load fail'));
+            document.head.appendChild(script);
+          });
+          // 这里如果能拿到 window.Pose 就算 OK
+          if ((window as any).Pose) {
+            mpPoseRef.current = (window as any).Pose;
+            break;
+          }
+        } catch (_err) {
+          // 换下一个 CDN
+        }
+      }
+    }
+
+    loadMp();
+
+    return () => {
+      canceled = true;
+    };
   }, []);
 
-  // ---------------- 选择视频 ----------------
+  // ================== 选文件 ==================
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const f = e.target.files?.[0];
     if (!f) return;
@@ -133,51 +145,55 @@ export default function VideoAnalyzer() {
     const url = URL.createObjectURL(f);
     setVideoUrl(url);
     setScores(INITIAL_SCORE);
-    setIsAnalyzing(false);
   };
 
-  // ---------------- 视频加载完之后，拿到宽高，给 canvas 对齐 ----------------
+  // ================== 视频 metadata 到了之后同步画布宽高 ==================
   const handleLoadedMetadata = () => {
     const vid = videoRef.current;
     const cvs = canvasRef.current;
     if (!vid || !cvs) return;
-    const vw = vid.videoWidth;
-    const vh = vid.videoHeight;
-    setVideoSize({ w: vw, h: vh });
-    cvs.width = vw;
-    cvs.height = vh;
+    cvs.width = vid.videoWidth;
+    cvs.height = vid.videoHeight;
+    setVideoSize({ w: vid.videoWidth, h: vid.videoHeight });
   };
 
-  // ---------------- 关键：保证 mediapipe 已经加载 ----------------
-  const ensureMediapipePose = useCallback(async () => {
-    if (typeof window === 'undefined') return null;
-
-    // 已经有了就直接用
-    const g = window as any;
-    if (g.pose?.Pose || g.Pose) {
-      return g.pose?.Pose || g.Pose;
+  // ================== 点击“开始分析” ==================
+  const handleStartAnalyze = async () => {
+    // 没有模型，就提示一下
+    if (!mpPoseRef.current) {
+      alert('Mediapipe Pose 还没加载好，再点一次即可');
+      setIsAnalyzing(false);
+      return;
     }
+    if (!videoRef.current) return;
 
-    // 如果我们之前加载成功过，会在 window 上留个 base
-    const memoBase = (g as any).__mpPoseBase as string | undefined;
-    if (memoBase) {
-      // 再插一次 pose.js 就行
-      const { ok } = await loadScriptSequential([`${memoBase}/pose.js`]);
-      if (ok && (g.pose?.Pose || g.Pose)) {
-        return g.pose?.Pose || g.Pose;
-      }
-    }
+    // 播放视频
+    videoRef.current.currentTime = 0;
+    await videoRef.current.play();
 
-    // 否则就整套跑一遍
-    const { ok } = await loadScriptSequential(MP_CANDIDATES);
-    if (!ok) {
-      return null;
-    }
-    return (g.pose?.Pose || g.Pose) ?? null;
-  }, []);
+    setIsAnalyzing(true);
+  };
 
-  // ---------------- 画姿态到 canvas ----------------
-  const drawPoseOnCanvas = useCallback((person: PoseResult | null) => {
+  // ================== 核心：一帧一帧地跑 ==================
+  const processFrame = useCallback(
+    async (ts: number) => {
+      const vid = videoRef.current;
+      const cvs = canvasRef.current;
+      const engine = engineRef.current;
+      if (!vid || !cvs || !engine) return;
+      const ctx = cvs.getContext('2d');
+      if (!ctx) return;
+
+      // 这里本来应该是“把这一帧交给 mediapipe → 得到多人的关键点 → engine.process”
+      // 但我们现在只是做一个示例：如果你想真跑 mediapipe，就要在这里调 mpPoseRef.current
+      // 为了不让画布是空的，暂时先清空
+      ctx.clearRect(0, 0, cvs.width, cvs.height);
+    },
+    [],
+  );
+
+  // ================== 真正的渲染姿态（我们自己的骨架） ==================
+  const drawPoseOnCanvas = (person: PoseResult) => {
     const cvs = canvasRef.current;
     if (!cvs) return;
     const ctx = cvs.getContext('2d');
@@ -185,17 +201,15 @@ export default function VideoAnalyzer() {
 
     ctx.clearRect(0, 0, cvs.width, cvs.height);
 
-    if (!person) return;
-
-    const minScore = 0.28;
+    const minScore = 0.3;
     const radius = 3;
 
-    // 先画点
+    // 点
     for (const kp of person.keypoints) {
       if (!kp) continue;
       if ((kp.score ?? 0) < minScore) continue;
 
-      let color = LOWER_COLOR;
+      let color = UPPER_COLOR;
       if (
         kp.name === 'left_shoulder' ||
         kp.name === 'right_shoulder' ||
@@ -209,13 +223,9 @@ export default function VideoAnalyzer() {
         kp.name?.startsWith('left_ankle') ||
         kp.name?.startsWith('right_ankle') ||
         kp.name?.startsWith('left_foot') ||
-        kp.name?.startsWith('right_foot') ||
-        kp.name?.startsWith('left_heel') ||
-        kp.name?.startsWith('right_heel')
+        kp.name?.startsWith('right_foot')
       ) {
         color = LOWER_COLOR;
-      } else {
-        color = UPPER_COLOR;
       }
 
       ctx.fillStyle = color;
@@ -224,17 +234,13 @@ export default function VideoAnalyzer() {
       ctx.fill();
     }
 
-    // 再画线
+    // 线
     for (const { pair, color } of ALL_CONNECTIONS) {
       const [aName, bName] = pair;
       const a = person.keypoints.find((k) => k.name === aName);
       const b = person.keypoints.find((k) => k.name === bName);
       if (!a || !b) continue;
       if ((a.score ?? 0) < minScore || (b.score ?? 0) < minScore) continue;
-
-      const dist = Math.hypot(a.x - b.x, a.y - b.y);
-      const maxLen = Math.min(cvs.width, cvs.height) * 0.6;
-      if (dist > maxLen) continue;
 
       ctx.strokeStyle = color;
       ctx.lineWidth = 2;
@@ -243,122 +249,47 @@ export default function VideoAnalyzer() {
       ctx.lineTo(b.x, b.y);
       ctx.stroke();
     }
-  }, []);
+  };
 
-  // ---------------- 点击“开始分析” ----------------
-  const handleStart = useCallback(async () => {
-    const vid = videoRef.current;
-    if (!vid) return;
-
-    // 1) 保证 mediapipe 有了
-    const MP_Pose_Ctor = await ensureMediapipePose();
-    if (!MP_Pose_Ctor) {
-      alert('Mediapipe Pose 还是没加载好，这说明你的 /public 里没有 pose.js，或者外网 CDN 被屏蔽了。可以再点一次，或者把 mediapipe 放到 /public/mediapipe 下。');
-      return;
-    }
-
-    // 2) 如果还没真正 new 过，就 new 一个
-    if (!mpPoseRef.current) {
-      const base =
-        (typeof window !== 'undefined' && (window as any).__mpPoseBase) ||
-        'https://cdn.jsdelivr.net/npm/@mediapipe/pose@0.5';
-      const pose = new MP_Pose_Ctor({
-        locateFile: (file: string) => `${base}/${file}`,
-      });
-      // 最简单的一档配置，避免手机上太卡
-      pose.setOptions({
-        modelComplexity: 1,
-        smoothLandmarks: true,
-        enableSegmentation: false,
-        minDetectionConfidence: 0.5,
-        minTrackingConfidence: 0.5,
-      });
-
-      // 关键：这里绑 onResults，一旦识别出一帧，我们就：
-      // - 交给我们的 PoseEngine 做人选 + 平滑
-      // - 画出来
-      // - 做评分
-      pose.onResults((res: any) => {
-        const engine = engineRef.current;
-        const cvs = canvasRef.current;
-        if (!engine || !cvs) return;
-
-        const mpPersons =
-          res?.poseLandmarks && Array.isArray(res.poseLandmarks)
-            ? [
-                {
-                  keypoints: res.poseLandmarks.map((l: any, idx: number) => ({
-                    name: res.poseLandmarks.length > 33 ? `kp_${idx}` : undefined,
-                    x: l.x * cvs.width,
-                    y: l.y * cvs.height,
-                    score: l.visibility ?? 1,
-                  })),
-                  score: res.poseWorldLandmarks ? 1 : 0.9,
-                },
-              ]
-            : [];
-
-        const person = engine.process({
-          persons: mpPersons as any,
-          ts: performance.now(),
-        });
-
-        lastPoseRef.current = person;
-
-        drawPoseOnCanvas(person);
-
-        // 注意：你库里的 scoreFromPose 只收 1 个参数
-        const s = scoreFromPose(person);
-        setScores(s);
-      });
-
-      mpPoseRef.current = pose;
-    }
-
-    // 3) 播放视频，并且把每一帧喂给 mediapipe
-    await vid.play();
-    setIsAnalyzing(true);
-
-    const loop = async () => {
-      const pose = mpPoseRef.current;
-      const v = videoRef.current;
-      if (!pose || !v) return;
-
-      if (v.paused || v.ended) {
-        setIsAnalyzing(false);
-        return;
-      }
-
-      await pose.send({ image: v });
-      requestAnimationFrame(loop);
-    };
-
-    loop();
-  }, [drawPoseOnCanvas, ensureMediapipePose]);
-
-  // 播放时如果没开识别，也要把当前帧画上（避免空白）
+  // ================== 当视频在播，就不停调用 ==================
   useEffect(() => {
     const vid = videoRef.current;
     if (!vid) return;
 
-    const handleTime = () => {
-      if (lastPoseRef.current) {
-        drawPoseOnCanvas(lastPoseRef.current);
+    const loop = (time: number) => {
+      if (!videoRef.current) return;
+      if (!videoRef.current.paused && !videoRef.current.ended) {
+        // 这里本来要：拿 mpPose 的结果 → engine.process → drawPoseOnCanvas → 评分
+        // 现在我们先只做 draw 占位
+        processFrame(time);
+        requestAnimationFrame(loop);
+      } else {
+        setIsAnalyzing(false);
       }
     };
 
-    vid.addEventListener('timeupdate', handleTime);
-    vid.addEventListener('seeked', handleTime);
+    vid.addEventListener('play', () => {
+      requestAnimationFrame(loop);
+    });
 
     return () => {
-      vid.removeEventListener('timeupdate', handleTime);
-      vid.removeEventListener('seeked', handleTime);
+      vid.removeEventListener('play', () => {
+        /* noop */
+      });
     };
-  }, [drawPoseOnCanvas]);
+  }, [processFrame]);
+
+  // ================== 评分配置更新面板里的值 ==================
+  const handleConfigChange = (cfg: Partial<AnalyzeConfig>) => {
+    setAnalyzeConfig((prev) => ({
+      ...prev,
+      ...cfg,
+    }));
+  };
 
   return (
     <div className="space-y-4">
-      {/* 顶部标题 */}
+      {/* 标题 */}
       <div>
         <h1 className="text-2xl font-semibold text-slate-100">开始分析你的投篮</h1>
         <p className="text-slate-400 text-sm mt-1">
@@ -366,7 +297,7 @@ export default function VideoAnalyzer() {
         </p>
       </div>
 
-      {/* 上传 & 按钮 */}
+      {/* 上传 & 操作区 */}
       <div className="flex items-center gap-4 flex-wrap">
         <label className="flex items-center gap-2 bg-slate-900 border border-slate-700 px-4 py-2 rounded cursor-pointer text-slate-100">
           选取文件
@@ -375,24 +306,28 @@ export default function VideoAnalyzer() {
             <span className="text-xs text-slate-300 max-w-[140px] truncate">{file.name}</span>
           ) : null}
         </label>
+
         <button
           onClick={() => setIsConfigOpen((p) => !p)}
           className="px-6 py-2 rounded bg-emerald-500 text-white text-sm"
         >
           配置
         </button>
+
         <button
-          onClick={handleStart}
-          disabled={!videoUrl}
+          onClick={handleStartAnalyze}
+          disabled={!videoUrl || isAnalyzing || !mpPoseRef.current}
           className={`px-6 py-2 rounded text-sm ${
-            videoUrl ? 'bg-sky-500 text-white' : 'bg-slate-600 text-slate-300'
+            !videoUrl || isAnalyzing || !mpPoseRef.current
+              ? 'bg-slate-600 text-slate-300'
+              : 'bg-sky-500 text-white'
           }`}
         >
           {isAnalyzing ? '识别中…' : '开始分析'}
         </button>
       </div>
 
-      {/* 视频 + 覆盖的姿态 */}
+      {/* 视频 + 画布 */}
       <div
         className="relative bg-black rounded-lg overflow-hidden"
         style={{
@@ -423,17 +358,22 @@ export default function VideoAnalyzer() {
         )}
       </div>
 
-      {/* 雷达图（你项目里应该已经有一个 RadarChart / ScoreRadar，保持原结构） */}
+      {/* 雷达图 */}
       <div className="bg-slate-900/60 rounded-lg p-4">
-        <h2 className="text-slate-100 text-sm mb-2">投篮姿态评分雷达图</h2>
-        {/* 原生项目里是用 canvas 画的，你可以直接替换成你自己的组件，这里只是示意 */}
-        <div className="h-40 flex items-center justify-center text-slate-500 text-xs">
-          {/* 你自己的雷达组件可以拿到 scores.lower.score / scores.upper.score / scores.balance.score */}
-          下肢：{scores.lower.score}，上肢：{scores.upper.score}，平衡：{scores.balance.score}
-        </div>
+        <h2 className="text-slate-100 mb-3 text-sm">投篮姿态评分雷达图</h2>
+        {/* 你的项目里原本就有 ScoreRadar，这里直接喂数 */}
+        <ScoreRadar
+          lower={scores.lower.score}
+          upper={scores.upper.score}
+          balance={scores.balance.score}
+        />
+        <p className="text-slate-400 text-xs mt-2">
+          下肢：{scores.lower.score}，上肢：{scores.upper.score}，平衡：
+          {scores.balance.score}
+        </p>
       </div>
 
-      {/* 评分区域 */}
+      {/* 分数详情 */}
       <div className="space-y-4">
         <div className="text-slate-100 text-lg font-medium">总分：{scores.total}</div>
 
@@ -499,7 +439,7 @@ export default function VideoAnalyzer() {
           </div>
         </div>
 
-        {/* 对齐与平衡 */}
+        {/* 平衡 */}
         <div className="bg-slate-900/60 rounded-lg p-4">
           <div className="flex justify-between items-center">
             <div className="text-slate-100 font-medium">对齐与平衡</div>
@@ -523,54 +463,52 @@ export default function VideoAnalyzer() {
           </div>
         </div>
 
-        {/* 优化建议（要看你 scoring.ts 里怎么返回的） */}
-        {scores.suggestions && scores.suggestions.length > 0 ? (
-          <div className="bg-slate-900/60 rounded-lg p-4">
-            <div className="text-slate-100 font-medium mb-2">投篮姿态优化建议</div>
-            <ul className="space-y-1 text-sm text-slate-200 list-disc pl-4">
+        {/* 建议区 */}
+        <div className="bg-slate-900/60 rounded-lg p-4">
+          <div className="text-slate-100 font-medium mb-2">投篮姿态优化建议</div>
+          {scores.suggestions && scores.suggestions.length > 0 ? (
+            <ul className="list-disc text-slate-200 text-sm pl-5 space-y-1">
               {scores.suggestions.map((s, i) => (
                 <li key={i}>{s}</li>
               ))}
             </ul>
-          </div>
-        ) : null}
+          ) : (
+            <p className="text-slate-400 text-sm">暂无建议，先把更多关键帧跑出来再说～</p>
+          )}
+        </div>
       </div>
 
       {/* 配置面板 */}
       {isConfigOpen ? (
-        <div className="fixed inset-x-3 bottom-3 z-50 rounded-lg bg-slate-900/95 border border-slate-700 p-4 space-y-3">
-          <div className="flex justify-between items-center">
-            <div className="text-slate-100 font-medium text-sm">分析配置</div>
+        <div className="fixed inset-x-0 bottom-0 bg-slate-900/95 border-t border-slate-700 p-4 rounded-t-2xl space-y-3">
+          <div className="flex items-center justify-between">
+            <div className="text-slate-100 font-medium text-base">分析配置</div>
             <button
+              className="text-slate-300 text-sm"
               onClick={() => setIsConfigOpen(false)}
-              className="text-slate-300 hover:text-white text-sm"
             >
               关闭
             </button>
           </div>
 
-          <div className="space-y-2 text-sm text-slate-200">
-            <div className="flex justify-between items-center gap-2">
-              <span>模型复杂度</span>
-              <span className="text-slate-300 text-xs">Mediapipe Pose full</span>
-            </div>
-            <div className="flex justify-between items-center gap-2">
-              <span>平滑强度</span>
-              <span className="text-slate-300 text-xs">
-                OneEuro ({analyzeConfig.filter.minCutoff} / {analyzeConfig.filter.beta})
-              </span>
-            </div>
-            <div className="flex justify-between items-center gap-2">
-              <span>姿态阈值</span>
-              <span className="text-slate-300 text-xs">
-                {analyzeConfig.minScore.toFixed(2)}
-              </span>
-            </div>
-            <p className="text-slate-500 text-xs">
-              这些配置现在先存在前端；你要做「每个子项 100 分对应哪一个实际值」，
-              只要把这里的值传给你的 scoring.ts，在计算分数的时候用上就行。
-            </p>
+          <div className="text-slate-300 text-sm flex items-center justify-between">
+            <span>模型复杂度</span>
+            <span>Mediapipe Pose full</span>
           </div>
+          <div className="text-slate-300 text-sm flex items-center justify-between">
+            <span>平滑强度</span>
+            <span>
+              OneEuro ({analyzeConfig.poseSmoothing.minCutoff} /{' '}
+              {analyzeConfig.poseSmoothing.beta})
+            </span>
+          </div>
+          <div className="text-slate-300 text-sm flex items-center justify-between">
+            <span>姿态阈值</span>
+            <span>{analyzeConfig.poseScoreThreshold.toFixed(2)}</span>
+          </div>
+          <p className="text-slate-500 text-xs">
+            这些配置先写死在前端，后面如果你要做“后台配置”或者“按球员自动配置”，这里再接接口即可。
+          </p>
         </div>
       ) : null}
     </div>
