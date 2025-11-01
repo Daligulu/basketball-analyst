@@ -28,15 +28,14 @@ export type PoseConfig = {
   kpMinScore: number;
 };
 
-// 这是线上版 VideoAnalyzer.tsx 已经在用的字段
+// 线上版 VideoAnalyzer.tsx 已经在用的字段
 export type PoseSmoothingConfig = {
   minCutoff: number;
   beta: number;
   dCutoff: number;
 };
 
-// 线上那份代码里出现的是 analyzeConfig.model
-// 我们就直接按它的叫法给出来
+// 线上代码里是 analyzeConfig.model
 export type PoseModel = 'mediapipe-full' | 'mediapipe-lite';
 
 // ------------------ 总配置 ------------------
@@ -51,19 +50,19 @@ export type AnalyzeConfig = {
   // ⭐ 线上版里用的字段
   poseSmoothing: PoseSmoothingConfig;
 
-  thresholds: AnalyzeThresholds;
+  // ⭐ 线上版 VideoAnalyzer.tsx 要展示的
+  poseThreshold: number;
 
-  // 给将来/别的分支撑个兜底
-  [key: string]: unknown;
+  thresholds: AnalyzeThresholds;
 };
 
-// ------------------ 默认配置（这次的重点改动也在这） ------------------
+// ------------------ 默认配置（含这次的放宽） ------------------
 
 export const DEFAULT_ANALYZE_CONFIG: AnalyzeConfig = {
-  // 线上版用来判断 new Pose(...) 里 modelComplexity 的
+  // 线上版用来判断 mediapipe Pose 的复杂度
   model: 'mediapipe-full',
 
-  // 本地(zip)版一直都有的
+  // 本地(zip)里的老写法
   pose: {
     modelComplexity: 'full',
     smoothMinCutoff: 1.15,
@@ -71,12 +70,16 @@ export const DEFAULT_ANALYZE_CONFIG: AnalyzeConfig = {
     kpMinScore: 0.35,
   },
 
-  // 给线上版的 engineRef / PoseCtor 用的平滑参数
+  // 线上版的 OneEuro 参数
   poseSmoothing: {
     minCutoff: 1.15,
     beta: 0.05,
     dCutoff: 1.0,
   },
+
+  // 线上组件要显示的“姿态阈值”
+  // 你线上代码里画骨架用的是 0.28，这里就用 0.28
+  poseThreshold: 0.28,
 
   thresholds: {
     lower: {
@@ -89,12 +92,11 @@ export const DEFAULT_ANALYZE_CONFIG: AnalyzeConfig = {
       follow100: 0.4,
       elbowTight100: 2,
     },
-    // ⭐⭐ 本次要放宽的地方 ⭐⭐
+    // ⭐⭐ 本次真正要改的地方：放宽平衡容差 ⭐⭐
     balance: {
-      // 原始代码是 center100: 1, align100: 2 导致你截图里两个都是 0
-      // 放到日常手机拍摄能接受的范围
-      center100: 35,  // 横向偏到 35% 身体宽度内算 100 分
-      align100: 30,   // 躯干和脚方向在 30° 内算 100 分
+      // 原来是 1 / 2，太苛刻了
+      center100: 35,  // 横向偏到 35% 身体宽度内算 100
+      align100: 30,   // 躯干与脚方向 30° 内算 100
     },
   },
 };
@@ -115,34 +117,33 @@ export function loadAnalyzeConfig(): AnalyzeConfig {
     }
 
     const parsed = JSON.parse(raw) as Partial<AnalyzeConfig> & {
-      // 老版本里可能只有 pose / 没有 poseSmoothing / 没有 model
       pose?: Partial<PoseConfig>;
       poseSmoothing?: Partial<PoseSmoothingConfig>;
       model?: PoseModel;
+      poseThreshold?: number;
     };
 
-    // 1) 先合并 pose
+    // 1) pose 合并
     const mergedPose: PoseConfig = {
       ...DEFAULT_ANALYZE_CONFIG.pose,
       ...(parsed.pose ?? {}),
     };
 
-    // 2) 再合并 poseSmoothing
+    // 2) poseSmoothing 合并
     const mergedPoseSmoothing: PoseSmoothingConfig = {
       ...DEFAULT_ANALYZE_CONFIG.poseSmoothing,
       ...(parsed.poseSmoothing ?? {}),
     };
 
-    // 2.1 老数据只有 pose，没有 poseSmoothing → 从 pose 里抄一份
+    // 2.1 旧数据只有 pose → 同步到 poseSmoothing
     if (!parsed.poseSmoothing && parsed.pose) {
       mergedPoseSmoothing.minCutoff =
         parsed.pose.smoothMinCutoff ?? mergedPoseSmoothing.minCutoff;
       mergedPoseSmoothing.beta =
         parsed.pose.smoothBeta ?? mergedPoseSmoothing.beta;
-      // dCutoff 没有就用默认的 1.0
     }
 
-    // 2.2 反方向：只有 poseSmoothing，没有 pose → 同步到 pose
+    // 2.2 旧数据只有 poseSmoothing → 同步回 pose
     if (!parsed.pose && parsed.poseSmoothing) {
       mergedPose.smoothMinCutoff =
         parsed.poseSmoothing.minCutoff ?? mergedPose.smoothMinCutoff;
@@ -150,7 +151,7 @@ export function loadAnalyzeConfig(): AnalyzeConfig {
         parsed.poseSmoothing.beta ?? mergedPose.smoothBeta;
     }
 
-    // 3) 合并 thresholds
+    // 3) 阈值合并
     const mergedThresholds: AnalyzeThresholds = {
       ...DEFAULT_ANALYZE_CONFIG.thresholds,
       ...(parsed.thresholds ?? {}),
@@ -168,7 +169,7 @@ export function loadAnalyzeConfig(): AnalyzeConfig {
       },
     };
 
-    // 4) ⭐ 关键兜底：如果本地还存着老的 1 / 2，就自动抬到我们这次的放宽值
+    // 4) ⭐ 把旧的 1 / 2 自动抬高
     if (
       mergedThresholds.balance.center100 <
       DEFAULT_ANALYZE_CONFIG.thresholds.balance.center100
@@ -184,14 +185,21 @@ export function loadAnalyzeConfig(): AnalyzeConfig {
         DEFAULT_ANALYZE_CONFIG.thresholds.balance.align100;
     }
 
-    // 5) ⭐ 线上版需要的 model，没有就给默认的
+    // 5) 线上版需要的 model
     const mergedModel: PoseModel =
       parsed.model ?? DEFAULT_ANALYZE_CONFIG.model;
+
+    // 6) 线上版要展示的 poseThreshold
+    const mergedPoseThreshold =
+      typeof parsed.poseThreshold === 'number'
+        ? parsed.poseThreshold
+        : DEFAULT_ANALYZE_CONFIG.poseThreshold;
 
     return {
       model: mergedModel,
       pose: mergedPose,
       poseSmoothing: mergedPoseSmoothing,
+      poseThreshold: mergedPoseThreshold,
       thresholds: mergedThresholds,
     };
   } catch (err) {
