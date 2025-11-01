@@ -17,7 +17,7 @@ import {
 import { scoreFromPose, type AnalyzeScore } from '@/lib/analyze/scoring';
 import RadarChart from '@/components/RadarChart';
 
-// 和原 scoring.ts 返回的结构保持一致
+// 和 scoring.ts 里的结构对齐的一个兜底初始值
 const EMPTY_SCORE: AnalyzeScore = {
   total: 0,
   lower: {
@@ -39,25 +39,24 @@ const EMPTY_SCORE: AnalyzeScore = {
   },
 };
 
-// 统一写这里，浏览器里随便加
 const MP_CDN_BASES = [
-  // 官方
   'https://cdn.jsdelivr.net/npm/@mediapipe/pose',
-  // 你的国内镜像可以放这里
   'https://fastly.jsdelivr.net/npm/@mediapipe/pose',
 ];
 
-// 注入 <script> 的小工具
+// 动态注入脚本（浏览器端）
 function injectScript(src: string): Promise<void> {
   if (typeof window === 'undefined') return Promise.resolve();
   return new Promise((resolve, reject) => {
-    // 浏览器已经有了就不再加
-    const existed = document.querySelector(`script[src="${src}"]`) as HTMLScriptElement | null;
+    const existed = document.querySelector(
+      `script[src="${src}"]`,
+    ) as HTMLScriptElement | null;
     if (existed) {
       existed.addEventListener('load', () => resolve());
       existed.addEventListener('error', () => reject());
-      // 有可能已经是 loaded
-      if ((existed as any).readyState === 'complete') resolve();
+      // 有可能本来就 loaded 了
+      // @ts-expect-error
+      if (existed.readyState === 'complete') resolve();
       return;
     }
     const s = document.createElement('script');
@@ -83,20 +82,19 @@ export default function VideoAnalyzer() {
   const [isConfigOpen, setIsConfigOpen] = useState(false);
   const [videoSize, setVideoSize] = useState<{ w: number; h: number }>({ w: 0, h: 0 });
 
-  // 可配置评分基线（你可以在页面里改）
+  // 前端可调的评分基线（面板里改的是这个）
   const [scoringBase, setScoringBase] = useState({
-    squatKneeDeg: 165, // 下蹲 100 分对应角度
-    kneeExtSpeed: 260, // 伸膝 100 分对应度/秒
-    releaseDeg: 158,   // 出手角
-    followSec: 0.4,    // 随挥保持时间
-    elbowTightPct: 2,  // 肘路径紧凑百分比
+    squatKneeDeg: 165,
+    kneeExtSpeed: 260,
+    releaseDeg: 158,
+    followSec: 0.4,
+    elbowTightPct: 2,
     balanceCenterPct: 1,
     balanceAlignDeg: 2,
   });
 
-  // 1. 初始化我们自己的 PoseEngine（只是做 keypoint 选人 + one-euro）
+  // 1. 初始化我们自己的 PoseEngine
   useEffect(() => {
-    // 这里不能访问 scoring 里的结构，因此只用 one-euro 的默认
     engineRef.current = new PoseEngine({
       smooth: {
         minCutoff: 1.15,
@@ -106,23 +104,16 @@ export default function VideoAnalyzer() {
     } as any);
   }, []);
 
-  // 2. 浏览器端挂 Mediapipe Pose（CDN）
+  // 2. 加载 Mediapipe（CDN 兜底）
   useEffect(() => {
     if (typeof window === 'undefined') return;
-
-    // 如果已经有了就算了
     if ((window as any).mpPoseReady) return;
 
     (async () => {
       for (const base of MP_CDN_BASES) {
         try {
-          // 关键：先加载 core，再加载 pose
-          await injectScript(`${base}/@mediapipe_pose.js`)
-            .catch(() => injectScript(`${base}/pose.js`));
-
-          // 部分版本要一起加载的
-          await injectScript(`${base}/pose.js`).catch(() => {});
-
+          // 试着加载 pose.js
+          await injectScript(`${base}/pose.js`);
           (window as any).mpPoseReady = true;
           break;
         } catch (err) {
@@ -143,7 +134,7 @@ export default function VideoAnalyzer() {
     setIsAnalyzing(false);
   };
 
-  // 4. 视频元数据
+  // 4. 视频元数据 → 同步 canvas 大小，防拉伸
   const handleLoadedMetadata = () => {
     const vid = videoRef.current;
     const cvs = canvasRef.current;
@@ -155,7 +146,7 @@ export default function VideoAnalyzer() {
     cvs.height = h;
   };
 
-  // 5. 画姿态
+  // 5. 画姿态到 canvas
   const drawPoseOnCanvas = useCallback((person: PoseResult) => {
     const cvs = canvasRef.current;
     if (!cvs) return;
@@ -173,6 +164,7 @@ export default function VideoAnalyzer() {
       if ((kp.score ?? 0) < minScore) continue;
 
       let color = UPPER_COLOR;
+
       if (
         kp.name === 'left_shoulder' ||
         kp.name === 'right_shoulder' ||
@@ -212,45 +204,43 @@ export default function VideoAnalyzer() {
     }
   }, []);
 
-  // 6. 点「开始分析」
+  // 6. 开始分析
   const handleStart = async () => {
     if (!videoRef.current) return;
 
-    // Mediapipe 还没好
     if (typeof window !== 'undefined' && !(window as any).mpPoseReady) {
       alert('Mediapipe Pose 还没加载好，再点一次即可');
       return;
     }
 
-    // 初始化 mediapipe 的实例（只初始化一次）
+    // 初始化 mediapipe pose 一次
     if (!mpPoseRef.current && typeof window !== 'undefined') {
       const mp: any = (window as any).Pose || (window as any).pose;
       if (!mp) {
-        alert('浏览器里没拿到 Mediapipe Pose，稍后再试一次');
+        alert('浏览器没拿到 Mediapipe Pose 实例，稍后再试一次');
         return;
       }
+
       const pose = new mp.Pose({
-        locateFile: (file: string) => {
-          // 走第一个 CDN
-          return `${MP_CDN_BASES[0]}/${file}`;
-        },
+        locateFile: (file: string) => `${MP_CDN_BASES[0]}/${file}`,
       });
-      // 姿态回调
+
+      // 收结果
       pose.onResults((res: any) => {
         if (!engineRef.current) return;
         if (!res || !res.poseLandmarks) return;
 
-        // Mediapipe 是 0~1 归一化的，这里转成像素
-        const vid = videoRef.current;
         const cvs = canvasRef.current;
-        if (!vid || !cvs) return;
+        const vid = videoRef.current;
+        if (!cvs || !vid) return;
 
         const w = cvs.width;
         const h = cvs.height;
 
+        // Mediapipe 的 landmarks 是 0~1，需要转成像素
         const kp = res.poseLandmarks.map((lm: any, idx: number) => {
           return {
-            name: res.poseLandmarks[idx]?.name ?? `kp_${idx}`,
+            name: `kp_${idx}`, // Mediapipe 默认没有 name，我们给一个
             x: lm.x * w,
             y: lm.y * h,
             z: lm.z,
@@ -258,10 +248,11 @@ export default function VideoAnalyzer() {
           };
         });
 
-        const person = engineRef.current!.process({
+        // ⭐️ 这里就是刚才 Vercel 报错的地方：id 不能是 number，要是 string
+        const person = engineRef.current.process({
           persons: [
             {
-              id: 0,
+              id: 'mp-person',
               keypoints: kp,
             },
           ],
@@ -272,29 +263,30 @@ export default function VideoAnalyzer() {
 
         lastPoseRef.current = person;
         drawPoseOnCanvas(person);
-        // 这里用你仓库里的 scoring 逻辑，把算出来的分数直接塞进来
+
+        // 你的 scoring 目前只要 pose 一个参数
         setScores(scoreFromPose(person));
       });
 
       mpPoseRef.current = pose;
     }
 
-    // 让视频从头播
+    // 视频从 0 播
     videoRef.current.currentTime = 0;
     await videoRef.current.play();
-
     setIsAnalyzing(true);
 
-    // 每一帧把视频喂给 mediapipe
+    // 喂每一帧
     const loop = async () => {
-      if (!videoRef.current) return;
-      if (videoRef.current.paused || videoRef.current.ended) {
+      const vid = videoRef.current;
+      if (!vid) return;
+      if (vid.paused || vid.ended) {
         setIsAnalyzing(false);
         return;
       }
 
       if (mpPoseRef.current) {
-        await mpPoseRef.current.send({ image: videoRef.current });
+        await mpPoseRef.current.send({ image: vid });
       }
 
       requestAnimationFrame(loop);
@@ -312,7 +304,7 @@ export default function VideoAnalyzer() {
         </p>
       </div>
 
-      {/* 上传 + 配置 + 开始 */}
+      {/* 上传&按钮 */}
       <div className="flex items-center gap-4 flex-wrap">
         <label className="flex items-center gap-2 bg-slate-900 border border-slate-700 px-4 py-2 rounded cursor-pointer text-slate-100">
           选取文件
@@ -345,13 +337,14 @@ export default function VideoAnalyzer() {
         </button>
       </div>
 
-      {/* 视频+canvas */}
+      {/* 视频+姿态 */}
       <div
         className="relative bg-black rounded-lg overflow-hidden"
         style={{
           width: '100%',
           maxWidth: '720px',
-          aspectRatio: videoSize.w && videoSize.h ? `${videoSize.w} / ${videoSize.h}` : '9 / 16',
+          aspectRatio:
+            videoSize.w && videoSize.h ? `${videoSize.w} / ${videoSize.h}` : '9 / 16',
         }}
       >
         {videoUrl ? (
@@ -377,7 +370,7 @@ export default function VideoAnalyzer() {
         )}
       </div>
 
-      {/* 雷达图 */}
+      {/* 雷达图（去掉总分，只看三大块） */}
       <div className="flex flex-col gap-2">
         <div className="text-slate-100 text-base font-medium">投篮姿态评分雷达图</div>
         <RadarChart
@@ -390,7 +383,7 @@ export default function VideoAnalyzer() {
         </div>
       </div>
 
-      {/* 打分 */}
+      {/* 评分面板 */}
       <div className="space-y-4">
         <div className="text-slate-100 text-lg font-medium">总分：{scores.total}</div>
 
@@ -481,7 +474,7 @@ export default function VideoAnalyzer() {
         </div>
       </div>
 
-      {/* 配置 */}
+      {/* 配置面板 */}
       {isConfigOpen ? (
         <div className="fixed inset-x-0 bottom-0 bg-slate-900/95 border-t border-slate-700 p-4 space-y-3 z-50">
           <div className="flex justify-between items-center">
@@ -494,7 +487,6 @@ export default function VideoAnalyzer() {
             </button>
           </div>
 
-          {/* 每一项 100 分对应的值 */}
           <div className="grid grid-cols-2 gap-3 text-sm text-slate-200">
             <label className="flex flex-col gap-1">
               <span>下蹲 100分对应膝角(°)</span>
@@ -576,8 +568,8 @@ export default function VideoAnalyzer() {
           </div>
 
           <p className="text-slate-500 text-xs">
-            这些参数目前只保存在前端，如果要「真正参与评分」请在
-            <code className="mx-1">lib/analyze/scoring.ts</code> 里把这些值读进去。
+            上面这些是前端可调参数，要想真正喂进评分逻辑，请在
+            <code className="mx-1">lib/analyze/scoring.ts</code> 里读取这些值。
           </p>
         </div>
       ) : null}
