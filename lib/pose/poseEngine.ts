@@ -1,5 +1,5 @@
 // lib/pose/poseEngine.ts
-// 把浏览器/后端出来的“多人姿态” → 选出最像投篮前景的那个人 → 做平滑 → 给前端/分析层用
+// 把“多人检测一帧” → 选出前景投篮的人 → 按关键点做平滑 → 返回给前端画
 
 import { OneEuro2D, type OneEuroConfig } from './oneEuro2d';
 
@@ -10,89 +10,132 @@ export type PoseKeypoint = {
   score?: number;
 };
 
-export type PoseResult = {
-  id: string;
+export type RawPerson = {
   keypoints: PoseKeypoint[];
+  score?: number;
+};
+
+export type PoseFrame = {
+  persons: RawPerson[];
+  /** ms 时间戳 */
+  ts: number;
+};
+
+export type PoseResult = {
+  keypoints: PoseKeypoint[];
+  ts: number;
 };
 
 export type CoachConfig = {
+  /** 全局平滑配置，可不传 */
   smooth?: OneEuroConfig;
 };
 
-// 取关键点的小工具
-export function findKeypoint(
-  p: PoseResult | null | undefined,
-  name: string,
-): PoseKeypoint | null {
-  if (!p) return null;
-  return p.keypoints.find((k) => k.name === name) ?? null;
-}
-
-// 给一个人做“像投篮的程度”的打分，用来从多人里挑出前景
-function personScore(p: PoseResult): number {
-  const ls = findKeypoint(p, 'left_shoulder');
-  const rs = findKeypoint(p, 'right_shoulder');
-  const lh = findKeypoint(p, 'left_hip');
-  const rh = findKeypoint(p, 'right_hip');
-  const la = findKeypoint(p, 'left_ankle');
-  const ra = findKeypoint(p, 'right_ankle');
-
-  const scores = [ls, rs, lh, rh, la, ra]
-    .filter(Boolean)
-    .map((k) => k!.score ?? 0);
-
-  if (!scores.length) return 0;
-
-  // 关键点越多、分越高的优先
-  let s = scores.reduce((a, b) => a + b, 0);
-
-  // 脚越靠画面底部越像是离镜头最近的人
-  const footY = Math.max(la?.y ?? 0, ra?.y ?? 0);
-  s += footY * 0.002;
-
-  return s;
-}
+// 哪些点我们认为是“前景最重要”的，用来挑那个真正投篮的人
+const IMPORTANT_JOINTS = [
+  'nose',
+  'left_shoulder',
+  'right_shoulder',
+  'left_hip',
+  'right_hip',
+  'left_wrist',
+  'right_wrist',
+];
 
 export class PoseEngine {
   private cfg: CoachConfig;
-  private smoother = new Map<string, OneEuro2D>();
+  // 每个关键点一个滤波器
+  private filters = new Map<string, OneEuro2D>();
 
   constructor(cfg: CoachConfig = {}) {
     this.cfg = cfg;
   }
 
   /**
-   * @param frame  { persons: PoseResult[], ts: number(ms) }
-   * @returns  选出来&平滑之后的那一个人
+   * 选一个最像投篮主体的人
+   * 策略：score 高 + 靠画面中间 + 靠下
    */
-  process(frame: { persons: PoseResult[]; ts: number }): PoseResult | null {
-    const persons = frame.persons ?? [];
-    if (!persons.length) return null;
+  private pickPerson(frame: PoseFrame): RawPerson | null {
+    if (!frame.persons || frame.persons.length === 0) return null;
 
-    // 1. 选前景
-    const best = [...persons].sort((a, b) => personScore(b) - personScore(a))[0];
-    if (!best) return null;
+    const centerX = 0.5 *
+      (frame.persons[0]?.keypoints?.[0]?.x
+        ? // 有像素，就用第一帧视频宽度的一半，这个值其实没法这里拿到，就用 0～1 归一做个近似
+          1
+        : 1);
+    // 上面这块其实用不到真实宽度，我们主要靠 score 来排
 
-    // 2. 做平滑
-    if (this.cfg.smooth) {
-      const id = best.id;
-      const t = frame.ts / 1000; // 转成秒，跟滤波器统一
-      if (!this.smoother.has(id)) {
-        this.smoother.set(id, new OneEuro2D(this.cfg.smooth));
+    let best: RawPerson | null = null;
+    let bestScore = -Infinity;
+
+    for (const p of frame.persons) {
+      if (!p.keypoints || p.keypoints.length === 0) continue;
+
+      // 基础分：检测器给的
+      const base = typeof p.score === 'number' ? p.score * 100 : 0;
+
+      // 取一下肩膀/髋部，估计一下“在不在中间”
+      const ls = p.keypoints.find((k) => k.name === 'left_shoulder');
+      const rs = p.keypoints.find((k) => k.name === 'right_shoulder');
+      const lh = p.keypoints.find((k) => k.name === 'left_hip');
+      const rh = p.keypoints.find((k) => k.name === 'right_hip');
+
+      const cx =
+        ((ls?.x ?? rs?.x ?? lh?.x ?? rh?.x) ?? 0) / 1000; // 粗糙归一化，防止 NaN
+      const cy =
+        ((ls?.y ?? rs?.y ?? lh?.y ?? rh?.y) ?? 0) / 1000;
+
+      // 越靠下越像前景
+      const bonusY = cy * 50;
+      // 越靠中间越好（这里中心写死 0.5）
+      const distToCenter = Math.abs(cx - 0.5);
+      const bonusX = (1 - distToCenter) * 40;
+
+      const total = base + bonusX + bonusY;
+
+      if (total > bestScore) {
+        bestScore = total;
+        best = p;
       }
-      const sm = this.smoother.get(id)!;
-      const newKps: PoseKeypoint[] = best.keypoints.map((k) => {
-        const f = sm.next(k.x, k.y, t);
-        return { ...k, x: f.x, y: f.y };
-      });
-      return { ...best, keypoints: newKps };
     }
 
     return best;
   }
-}
 
-// 👇 很关键：把所有类型都显式导出去，给 lib/analyze/* 用
-export type { PoseKeypoint as TPoseKeypoint, PoseResult as TPoseResult };
-export { PoseKeypoint }; // 让 isolatedModules 也看得见
-export { PoseResult };
+  private getFilter(jointName: string): OneEuro2D | null {
+    const base = this.cfg.smooth;
+    if (!base) return null;
+    let f = this.filters.get(jointName);
+    if (!f) {
+      f = new OneEuro2D(base);
+      this.filters.set(jointName, f);
+    }
+    return f;
+  }
+
+  /**
+   * 外部真正调用的接口
+   */
+  process(frame: PoseFrame): PoseResult | null {
+    const person = this.pickPerson(frame);
+    if (!person) return null;
+
+    const filtered: PoseKeypoint[] = person.keypoints.map((kp) => {
+      const f = this.getFilter(kp.name);
+      if (!f) {
+        return kp;
+      }
+      const sm = f.next(kp.x, kp.y, frame.ts);
+      return {
+        ...kp,
+        x: sm.x,
+        y: sm.y,
+      };
+    });
+
+    return {
+      keypoints: filtered,
+      ts: frame.ts,
+    };
+  }
+}
