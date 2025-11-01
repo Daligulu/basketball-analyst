@@ -7,328 +7,358 @@ import React, {
   useRef,
   useState,
 } from 'react';
-
 import { PoseEngine, type PoseResult } from '@/lib/pose/poseEngine';
-import {
-  DEFAULT_ANALYZE_CONFIG,
-  type AnalyzeConfig,
-} from '@/lib/analyze/config';
-import {
-  scoreFromPose,
-  EMPTY_SCORE,
-  type AnalyzeScore,
-} from '@/lib/analyze/scoring';
 import {
   ALL_CONNECTIONS,
   UPPER_COLOR,
   TORSO_COLOR,
   LOWER_COLOR,
 } from '@/lib/pose/skeleton';
+import { scoreFromPose, type AnalyzeScore } from '@/lib/analyze/scoring';
+import { DEFAULT_ANALYZE_CONFIG, type AnalyzeConfig } from '@/lib/analyze/config';
 
-// 本地 / 回源地址，先本地、再 /pose、最后 CDN
-const MP_BASES = [
-  '/mediapipe/pose',
-  '/mediapipe',
-  'https://cdn.jsdelivr.net/npm/@mediapipe/pose',
+// 本地初始化用的分数（你原来 UI 那套）
+const INITIAL_SCORE: AnalyzeScore = {
+  total: 0,
+  lower: {
+    score: 0,
+    squat: { score: 0, value: '未检测' },
+    kneeExt: { score: 0, value: '未检测' },
+  },
+  upper: {
+    score: 0,
+    releaseAngle: { score: 0, value: '未检测' },
+    armPower: { score: 0, value: '未检测' },
+    follow: { score: 0, value: '未检测' },
+    elbowTight: { score: 0, value: '未检测' },
+  },
+  balance: {
+    score: 0,
+    center: { score: 0, value: '未检测' },
+    align: { score: 0, value: '未检测' },
+  },
+  // 建议这块在 scoring 里有就会出来
+  suggestions: [],
+};
+
+// 这里列出我们「按顺序尝试」的 Mediapipe 地址
+// 前三个是你项目自己可以托管在 public/ 下的，不依赖任何 CDN
+const MP_CANDIDATES = [
+  '/mediapipe/pose.js',
+  '/mediapipe/pose/pose.js',
+  '/pose/pose.js',
+  // 真都没有才走 CDN
+  'https://cdn.jsdelivr.net/npm/@mediapipe/pose@0.5/pose.js',
+  'https://cdn.jsdelivr.net/npm/@mediapipe/pose@latest/pose.js',
 ];
 
-type MPose = any;
-
-function resolveMP(file: string): string {
-  if (typeof window === 'undefined') return '';
-  for (const base of MP_BASES) {
-    // 不写 @ts-expect-error 了，直接跑
-    return `${base}/${file}`;
+// ---------- 工具：按顺序往 <head> 里插 script ----------
+function loadScriptSequential(urls: string[]): Promise<{ ok: boolean; base?: string }> {
+  if (typeof window === 'undefined') {
+    return Promise.resolve({ ok: false });
   }
-  return '';
+
+  return new Promise((resolve) => {
+    const tryOne = (index: number) => {
+      if (index >= urls.length) {
+        resolve({ ok: false });
+        return;
+      }
+
+      const full = urls[index];
+      // 为了后面 locateFile 能拿到「不带文件名的 base」
+      const base = full.replace(/\/pose\.js$/, '').replace(/\/$/, '');
+
+      const s = document.createElement('script');
+      s.src = full;
+      s.async = true;
+      s.crossOrigin = 'anonymous';
+      s.onload = () => {
+        // 成功了就记住这个 base，后面 locateFile 用
+        (window as any).__mpPoseBase = base;
+        resolve({ ok: true, base });
+      };
+      s.onerror = () => {
+        s.remove();
+        tryOne(index + 1);
+      };
+      document.head.appendChild(s);
+    };
+
+    tryOne(0);
+  });
 }
 
-// 画到 canvas 上
-function drawPoseOnCanvas(
-  pose: PoseResult,
-  cfg: AnalyzeConfig,
-  ctx: CanvasRenderingContext2D,
-  width: number,
-  height: number,
-) {
-  const minScore = cfg.poseScoreThreshold ?? 0.35;
-  ctx.clearRect(0, 0, width, height);
-
-  const radius = 3;
-
-  // 画点
-  for (const kp of pose.keypoints) {
-    if (!kp) continue;
-    if ((kp.score ?? 0) < minScore) continue;
-
-    let color = UPPER_COLOR;
-
-    if (
-      kp.name === 'left_shoulder' ||
-      kp.name === 'right_shoulder' ||
-      kp.name === 'left_hip' ||
-      kp.name === 'right_hip'
-    ) {
-      color = TORSO_COLOR;
-    } else if (
-      kp.name?.startsWith('left_knee') ||
-      kp.name?.startsWith('right_knee') ||
-      kp.name?.startsWith('left_ankle') ||
-      kp.name?.startsWith('right_ankle') ||
-      kp.name?.startsWith('left_heel') ||
-      kp.name?.startsWith('right_heel')
-    ) {
-      color = LOWER_COLOR;
-    }
-
-    ctx.fillStyle = color;
-    ctx.beginPath();
-    ctx.arc(kp.x, kp.y, radius, 0, Math.PI * 2);
-    ctx.fill();
-  }
-
-  // 画线
-  for (const { pair, color } of ALL_CONNECTIONS) {
-    const [aName, bName] = pair;
-    const a = pose.keypoints.find((k) => k.name === aName);
-    const b = pose.keypoints.find((k) => k.name === bName);
-    if (!a || !b) continue;
-    if ((a.score ?? 0) < minScore || (b.score ?? 0) < minScore) continue;
-
-    const dist = Math.hypot(a.x - b.x, a.y - b.y);
-    const maxLen = Math.min(width, height) * 0.65;
-    if (dist > maxLen) continue;
-
-    ctx.strokeStyle = color;
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-    ctx.moveTo(a.x, a.y);
-    ctx.lineTo(b.x, b.y);
-    ctx.stroke();
-  }
-}
-
+// ---------- 主组件 ----------
 export default function VideoAnalyzer() {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+
+  // 我们自己写的“前景过滤 + 平滑”的小引擎
   const engineRef = useRef<PoseEngine | null>(null);
-  const mpPoseRef = useRef<MPose | null>(null);
+
+  // 真正的 mediapipe pose 实例
+  const mpPoseRef = useRef<any>(null);
+  // 上一帧的姿态（给打分 / 稳定用）
   const lastPoseRef = useRef<PoseResult | null>(null);
 
   const [file, setFile] = useState<File | null>(null);
-  const [videoUrl, setVideoUrl] = useState<string>('');
+  const [videoUrl, setVideoUrl] = useState('');
   const [isAnalyzing, setIsAnalyzing] = useState(false);
-  const [scores, setScores] = useState<AnalyzeScore>(EMPTY_SCORE);
-  const [cfg, setCfg] = useState<AnalyzeConfig>(DEFAULT_ANALYZE_CONFIG);
   const [isConfigOpen, setIsConfigOpen] = useState(false);
-  const [videoSize, setVideoSize] = useState<{ w: number; h: number }>({
-    w: 0,
-    h: 0,
+  const [scores, setScores] = useState<AnalyzeScore>(INITIAL_SCORE);
+  const [videoSize, setVideoSize] = useState<{ w: number; h: number }>({ w: 0, h: 0 });
+
+  // 评分相关的前端配置（你说要能在面板里改 100 分对应值，这里先塞进 state）
+  const [analyzeConfig, setAnalyzeConfig] = useState<AnalyzeConfig>({
+    ...DEFAULT_ANALYZE_CONFIG,
   });
 
-  // 1) 初始化引擎
+  // ---------------- 初始化 PoseEngine（我们自己的 2D 一阶滤波） ----------------
   useEffect(() => {
     engineRef.current = new PoseEngine({
-      smooth: cfg.smooth,
+      smooth: {
+        minCutoff: 1.15,
+        beta: 0.05,
+        dCutoff: 1.0,
+      },
     } as any);
+  }, []);
 
-    // 浏览器端再去加载 mediapipe
-    let cancelled = false;
-    (async () => {
-      if (typeof window === 'undefined') return;
-
-      // 动态加载 @mediapipe/pose
-      const baseJs = resolveMP('pose.js');
-      const baseWasm = resolveMP('pose.wasm'); // 这个不一定会用到，但先留着
-
-      // 如果前两个是本地的，其实就是 404 也没关系，我们兜底 CDN
-      // 这里不用 ts-ignore，直接用原生 script
-      const script = document.createElement('script');
-      script.src = baseJs;
-      script.async = true;
-      script.onload = () => {
-        if (cancelled) return;
-        const mp = (window as any).Pose;
-        const cam = (window as any).Camera;
-        const mpNamespace = (window as any).POSE || (window as any).pose;
-
-        // 新版的全局是 window.pose.Pose
-        const PoseCtor =
-          (window as any).pose?.Pose ||
-          (window as any).Pose ||
-          mp;
-
-        if (!PoseCtor) {
-          console.warn('Mediapipe Pose 没有挂到 window 上');
-          return;
-        }
-
-        const pose = new PoseCtor({
-          locateFile: (file: string) => resolveMP(file),
-        });
-
-        // 用最全的模式
-        pose.setOptions({
-          modelComplexity: 1,
-          smoothLandmarks: true,
-          enableSegmentation: false,
-          minDetectionConfidence: 0.5,
-          minTrackingConfidence: 0.5,
-        });
-
-        mpPoseRef.current = pose;
-      };
-      script.onerror = () => {
-        console.warn('加载 Mediapipe Pose 失败');
-      };
-      document.body.appendChild(script);
-    })();
-
-    return () => {
-      cancelled = true;
-    };
-  }, [cfg.smooth]);
-
-  // 2) 选择文件
+  // ---------------- 选择视频 ----------------
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const f = e.target.files?.[0];
     if (!f) return;
     setFile(f);
     const url = URL.createObjectURL(f);
     setVideoUrl(url);
-    setScores(EMPTY_SCORE);
+    setScores(INITIAL_SCORE);
     setIsAnalyzing(false);
   };
 
-  // 3) 视频信息出来后，设置 canvas 尺寸
+  // ---------------- 视频加载完之后，拿到宽高，给 canvas 对齐 ----------------
   const handleLoadedMetadata = () => {
-    const v = videoRef.current;
-    const c = canvasRef.current;
-    if (!v || !c) return;
-    c.width = v.videoWidth;
-    c.height = v.videoHeight;
-    setVideoSize({ w: v.videoWidth, h: v.videoHeight });
+    const vid = videoRef.current;
+    const cvs = canvasRef.current;
+    if (!vid || !cvs) return;
+    const vw = vid.videoWidth;
+    const vh = vid.videoHeight;
+    setVideoSize({ w: vw, h: vh });
+    cvs.width = vw;
+    cvs.height = vh;
   };
 
-  // 4) 真正开始分析
-  const handleStart = async () => {
-    const v = videoRef.current;
-    const pose = mpPoseRef.current;
-    if (!v) return;
-    if (!pose) {
-      alert('Mediapipe Pose 还没加载好，再点一次即可');
+  // ---------------- 关键：保证 mediapipe 已经加载 ----------------
+  const ensureMediapipePose = useCallback(async () => {
+    if (typeof window === 'undefined') return null;
+
+    // 已经有了就直接用
+    const g = window as any;
+    if (g.pose?.Pose || g.Pose) {
+      return g.pose?.Pose || g.Pose;
+    }
+
+    // 如果我们之前加载成功过，会在 window 上留个 base
+    const memoBase = (g as any).__mpPoseBase as string | undefined;
+    if (memoBase) {
+      // 再插一次 pose.js 就行
+      const { ok } = await loadScriptSequential([`${memoBase}/pose.js`]);
+      if (ok && (g.pose?.Pose || g.Pose)) {
+        return g.pose?.Pose || g.Pose;
+      }
+    }
+
+    // 否则就整套跑一遍
+    const { ok } = await loadScriptSequential(MP_CANDIDATES);
+    if (!ok) {
+      return null;
+    }
+    return (g.pose?.Pose || g.Pose) ?? null;
+  }, []);
+
+  // ---------------- 画姿态到 canvas ----------------
+  const drawPoseOnCanvas = useCallback((person: PoseResult | null) => {
+    const cvs = canvasRef.current;
+    if (!cvs) return;
+    const ctx = cvs.getContext('2d');
+    if (!ctx) return;
+
+    ctx.clearRect(0, 0, cvs.width, cvs.height);
+
+    if (!person) return;
+
+    const minScore = 0.28;
+    const radius = 3;
+
+    // 先画点
+    for (const kp of person.keypoints) {
+      if (!kp) continue;
+      if ((kp.score ?? 0) < minScore) continue;
+
+      let color = LOWER_COLOR;
+      if (
+        kp.name === 'left_shoulder' ||
+        kp.name === 'right_shoulder' ||
+        kp.name === 'left_hip' ||
+        kp.name === 'right_hip'
+      ) {
+        color = TORSO_COLOR;
+      } else if (
+        kp.name?.startsWith('left_knee') ||
+        kp.name?.startsWith('right_knee') ||
+        kp.name?.startsWith('left_ankle') ||
+        kp.name?.startsWith('right_ankle') ||
+        kp.name?.startsWith('left_foot') ||
+        kp.name?.startsWith('right_foot') ||
+        kp.name?.startsWith('left_heel') ||
+        kp.name?.startsWith('right_heel')
+      ) {
+        color = LOWER_COLOR;
+      } else {
+        color = UPPER_COLOR;
+      }
+
+      ctx.fillStyle = color;
+      ctx.beginPath();
+      ctx.arc(kp.x, kp.y, radius, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    // 再画线
+    for (const { pair, color } of ALL_CONNECTIONS) {
+      const [aName, bName] = pair;
+      const a = person.keypoints.find((k) => k.name === aName);
+      const b = person.keypoints.find((k) => k.name === bName);
+      if (!a || !b) continue;
+      if ((a.score ?? 0) < minScore || (b.score ?? 0) < minScore) continue;
+
+      const dist = Math.hypot(a.x - b.x, a.y - b.y);
+      const maxLen = Math.min(cvs.width, cvs.height) * 0.6;
+      if (dist > maxLen) continue;
+
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(a.x, a.y);
+      ctx.lineTo(b.x, b.y);
+      ctx.stroke();
+    }
+  }, []);
+
+  // ---------------- 点击“开始分析” ----------------
+  const handleStart = useCallback(async () => {
+    const vid = videoRef.current;
+    if (!vid) return;
+
+    // 1) 保证 mediapipe 有了
+    const MP_Pose_Ctor = await ensureMediapipePose();
+    if (!MP_Pose_Ctor) {
+      alert('Mediapipe Pose 还是没加载好，这说明你的 /public 里没有 pose.js，或者外网 CDN 被屏蔽了。可以再点一次，或者把 mediapipe 放到 /public/mediapipe 下。');
       return;
     }
 
-    v.currentTime = 0;
-    await v.play();
+    // 2) 如果还没真正 new 过，就 new 一个
+    if (!mpPoseRef.current) {
+      const base =
+        (typeof window !== 'undefined' && (window as any).__mpPoseBase) ||
+        'https://cdn.jsdelivr.net/npm/@mediapipe/pose@0.5';
+      const pose = new MP_Pose_Ctor({
+        locateFile: (file: string) => `${base}/${file}`,
+      });
+      // 最简单的一档配置，避免手机上太卡
+      pose.setOptions({
+        modelComplexity: 1,
+        smoothLandmarks: true,
+        enableSegmentation: false,
+        minDetectionConfidence: 0.5,
+        minTrackingConfidence: 0.5,
+      });
+
+      // 关键：这里绑 onResults，一旦识别出一帧，我们就：
+      // - 交给我们的 PoseEngine 做人选 + 平滑
+      // - 画出来
+      // - 做评分
+      pose.onResults((res: any) => {
+        const engine = engineRef.current;
+        const cvs = canvasRef.current;
+        if (!engine || !cvs) return;
+
+        const mpPersons =
+          res?.poseLandmarks && Array.isArray(res.poseLandmarks)
+            ? [
+                {
+                  keypoints: res.poseLandmarks.map((l: any, idx: number) => ({
+                    name: res.poseLandmarks.length > 33 ? `kp_${idx}` : undefined,
+                    x: l.x * cvs.width,
+                    y: l.y * cvs.height,
+                    score: l.visibility ?? 1,
+                  })),
+                  score: res.poseWorldLandmarks ? 1 : 0.9,
+                },
+              ]
+            : [];
+
+        const person = engine.process({
+          persons: mpPersons as any,
+          ts: performance.now(),
+        });
+
+        lastPoseRef.current = person;
+
+        drawPoseOnCanvas(person);
+
+        // 注意：你库里的 scoreFromPose 只收 1 个参数
+        const s = scoreFromPose(person);
+        setScores(s);
+      });
+
+      mpPoseRef.current = pose;
+    }
+
+    // 3) 播放视频，并且把每一帧喂给 mediapipe
+    await vid.play();
     setIsAnalyzing(true);
 
-    // 每帧让 mediapipe 跑一次
-    const runFrame = async () => {
-      if (!videoRef.current || videoRef.current.paused) {
+    const loop = async () => {
+      const pose = mpPoseRef.current;
+      const v = videoRef.current;
+      if (!pose || !v) return;
+
+      if (v.paused || v.ended) {
         setIsAnalyzing(false);
         return;
       }
-      await pose.send({ image: videoRef.current });
-      requestAnimationFrame(runFrame);
+
+      await pose.send({ image: v });
+      requestAnimationFrame(loop);
     };
 
-    // 绑定结果
-    pose.onResults((res: any) => {
-      const engine = engineRef.current;
-      const c = canvasRef.current;
-      if (!engine || !c) return;
-      const ctx = c.getContext('2d');
-      if (!ctx) return;
+    loop();
+  }, [drawPoseOnCanvas, ensureMediapipePose]);
 
-      // mediapipe 的点名字和我们引擎的名字可能不完全一样，
-      // 这里假设你已经在 poseEngine 里做了转换，这里只要把 points 塞进去
-      const persons = res.poseLandmarks
-        ? [
-            {
-              keypoints: res.poseLandmarks.map((lm: any, idx: number) => ({
-                name: lm.name || `p-${idx}`,
-                x: lm.x * c.width,
-                y: lm.y * c.height,
-                score: lm.visibility ?? 0.9,
-              })),
-              bbox: null,
-              score: 1,
-            },
-          ]
-        : [];
+  // 播放时如果没开识别，也要把当前帧画上（避免空白）
+  useEffect(() => {
+    const vid = videoRef.current;
+    if (!vid) return;
 
-      const person = engine.process({
-        persons,
-        ts: performance.now(),
-      });
-
-      if (!person) {
-        ctx.clearRect(0, 0, c.width, c.height);
-        setScores(EMPTY_SCORE);
-        return;
+    const handleTime = () => {
+      if (lastPoseRef.current) {
+        drawPoseOnCanvas(lastPoseRef.current);
       }
+    };
 
-      // 这里做一帧的“附加指标”计算
-      // 简单做：用髋部的左右差值估一个横向偏移；用肩髋夹角估一个对齐
-      const leftHip = person.keypoints.find((k) => k.name === 'left_hip');
-      const rightHip = person.keypoints.find((k) => k.name === 'right_hip');
-      const leftShoulder = person.keypoints.find((k) => k.name === 'left_shoulder');
-      const rightShoulder = person.keypoints.find((k) => k.name === 'right_shoulder');
+    vid.addEventListener('timeupdate', handleTime);
+    vid.addEventListener('seeked', handleTime);
 
-      const metrics: any = (person as any).metrics || {};
-
-      // 横向偏移：髋部中心到画面中心的百分比
-      if (leftHip && rightHip) {
-        const centerX = (leftHip.x + rightHip.x) / 2;
-        const frameCenterX = c.width / 2;
-        const offsetPx = Math.abs(centerX - frameCenterX);
-        const pct = (offsetPx / c.width) * 100;
-        metrics.centerOffsetPct = pct;
-      }
-
-      // 对齐：肩线和髋线的夹角
-      if (leftHip && rightHip && leftShoulder && rightShoulder) {
-        const hipDx = rightHip.x - leftHip.x;
-        const hipDy = rightHip.y - leftHip.y;
-        const shoulderDx = rightShoulder.x - leftShoulder.x;
-        const shoulderDy = rightShoulder.y - leftShoulder.y;
-
-        // 两条线之间的角度
-        const hipAngle = Math.atan2(hipDy, hipDx);
-        const shoulderAngle = Math.atan2(shoulderDy, shoulderDx);
-        const diffRad = Math.abs(hipAngle - shoulderAngle);
-        const diffDeg = (diffRad * 180) / Math.PI;
-        metrics.alignDeg = diffDeg;
-      }
-
-      (person as any).metrics = metrics;
-
-      lastPoseRef.current = person;
-      drawPoseOnCanvas(person, cfg, ctx, c.width, c.height);
-      setScores(scoreFromPose(person, cfg));
-    });
-
-    // 开始第一帧
-    requestAnimationFrame(runFrame);
-  };
-
-  // 配置面板里改配置
-  const handleCfgChange = (patch: Partial<AnalyzeConfig>) => {
-    setCfg((prev) => ({
-      ...prev,
-      ...patch,
-      targets: {
-        ...prev.targets,
-        ...(patch as any).targets,
-      },
-    }));
-  };
+    return () => {
+      vid.removeEventListener('timeupdate', handleTime);
+      vid.removeEventListener('seeked', handleTime);
+    };
+  }, [drawPoseOnCanvas]);
 
   return (
     <div className="space-y-4">
-      {/* 标题 */}
+      {/* 顶部标题 */}
       <div>
         <h1 className="text-2xl font-semibold text-slate-100">开始分析你的投篮</h1>
         <p className="text-slate-400 text-sm mt-1">
@@ -336,15 +366,13 @@ export default function VideoAnalyzer() {
         </p>
       </div>
 
-      {/* 上传 + 按钮 */}
+      {/* 上传 & 按钮 */}
       <div className="flex items-center gap-4 flex-wrap">
         <label className="flex items-center gap-2 bg-slate-900 border border-slate-700 px-4 py-2 rounded cursor-pointer text-slate-100">
           选取文件
           <input type="file" accept="video/*" className="hidden" onChange={handleFileChange} />
           {file ? (
-            <span className="text-xs text-slate-300 max-w-[140px] truncate">
-              {file.name}
-            </span>
+            <span className="text-xs text-slate-300 max-w-[140px] truncate">{file.name}</span>
           ) : null}
         </label>
         <button
@@ -364,7 +392,7 @@ export default function VideoAnalyzer() {
         </button>
       </div>
 
-      {/* 视频 + 覆盖层 */}
+      {/* 视频 + 覆盖的姿态 */}
       <div
         className="relative bg-black rounded-lg overflow-hidden"
         style={{
@@ -395,17 +423,17 @@ export default function VideoAnalyzer() {
         )}
       </div>
 
-      {/* 雷达图 */}
-      <div className="bg-slate-900/40 rounded-lg p-4">
-        <h2 className="text-slate-100 text-sm mb-3">投篮姿态评分雷达图</h2>
-        {/* 这里保持你原来项目的简单 SVG/Canvas 实现就行，我只把“总分”拿掉 */}
-        <div className="relative h-40">
-          {/* 你项目里应该有一个 RadarChart 组件，如果有就换成它 */}
-          <p className="text-slate-500 text-xs">下肢：{scores.lower.score}，上肢：{scores.upper.score}，平衡：{scores.balance.score}</p>
+      {/* 雷达图（你项目里应该已经有一个 RadarChart / ScoreRadar，保持原结构） */}
+      <div className="bg-slate-900/60 rounded-lg p-4">
+        <h2 className="text-slate-100 text-sm mb-2">投篮姿态评分雷达图</h2>
+        {/* 原生项目里是用 canvas 画的，你可以直接替换成你自己的组件，这里只是示意 */}
+        <div className="h-40 flex items-center justify-center text-slate-500 text-xs">
+          {/* 你自己的雷达组件可以拿到 scores.lower.score / scores.upper.score / scores.balance.score */}
+          下肢：{scores.lower.score}，上肢：{scores.upper.score}，平衡：{scores.balance.score}
         </div>
       </div>
 
-      {/* 分数详情 */}
+      {/* 评分区域 */}
       <div className="space-y-4">
         <div className="text-slate-100 text-lg font-medium">总分：{scores.total}</div>
 
@@ -471,7 +499,7 @@ export default function VideoAnalyzer() {
           </div>
         </div>
 
-        {/* 平衡 */}
+        {/* 对齐与平衡 */}
         <div className="bg-slate-900/60 rounded-lg p-4">
           <div className="flex justify-between items-center">
             <div className="text-slate-100 font-medium">对齐与平衡</div>
@@ -494,13 +522,25 @@ export default function VideoAnalyzer() {
             </div>
           </div>
         </div>
+
+        {/* 优化建议（要看你 scoring.ts 里怎么返回的） */}
+        {scores.suggestions && scores.suggestions.length > 0 ? (
+          <div className="bg-slate-900/60 rounded-lg p-4">
+            <div className="text-slate-100 font-medium mb-2">投篮姿态优化建议</div>
+            <ul className="space-y-1 text-sm text-slate-200 list-disc pl-4">
+              {scores.suggestions.map((s, i) => (
+                <li key={i}>{s}</li>
+              ))}
+            </ul>
+          </div>
+        ) : null}
       </div>
 
       {/* 配置面板 */}
       {isConfigOpen ? (
-        <div className="bg-slate-900/90 rounded-lg p-4 border border-slate-700 space-y-4">
+        <div className="fixed inset-x-3 bottom-3 z-50 rounded-lg bg-slate-900/95 border border-slate-700 p-4 space-y-3">
           <div className="flex justify-between items-center">
-            <div className="text-slate-100 font-medium">分析配置</div>
+            <div className="text-slate-100 font-medium text-sm">分析配置</div>
             <button
               onClick={() => setIsConfigOpen(false)}
               className="text-slate-300 hover:text-white text-sm"
@@ -509,186 +549,28 @@ export default function VideoAnalyzer() {
             </button>
           </div>
 
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-sm text-slate-100">
-            {/* 下肢 */}
-            <div>
-              <div className="font-semibold mb-1">下肢</div>
-              <label className="flex items-center justify-between gap-2 mb-1">
-                <span>下蹲膝角(100分)</span>
-                <input
-                  type="number"
-                  value={cfg.targets.squatKneeAngle}
-                  onChange={(e) =>
-                    handleCfgChange({
-                      targets: {
-                        ...cfg.targets,
-                        squatKneeAngle: Number(e.target.value),
-                      },
-                    })
-                  }
-                  className="bg-slate-800 rounded px-2 py-1 w-20 text-right"
-                />
-              </label>
-              <label className="flex items-center justify-between gap-2 mb-1">
-                <span>伸膝速度(100分)</span>
-                <input
-                  type="number"
-                  value={cfg.targets.kneeExtSpeed}
-                  onChange={(e) =>
-                    handleCfgChange({
-                      targets: {
-                        ...cfg.targets,
-                        kneeExtSpeed: Number(e.target.value),
-                      },
-                    })
-                  }
-                  className="bg-slate-800 rounded px-2 py-1 w-20 text-right"
-                />
-              </label>
+          <div className="space-y-2 text-sm text-slate-200">
+            <div className="flex justify-between items-center gap-2">
+              <span>模型复杂度</span>
+              <span className="text-slate-300 text-xs">Mediapipe Pose full</span>
             </div>
-
-            {/* 上肢 */}
-            <div>
-              <div className="font-semibold mb-1">上肢</div>
-              <label className="flex items-center justify-between gap-2 mb-1">
-                <span>出手角(100分)</span>
-                <input
-                  type="number"
-                  value={cfg.targets.releaseAngle}
-                  onChange={(e) =>
-                    handleCfgChange({
-                      targets: {
-                        ...cfg.targets,
-                        releaseAngle: Number(e.target.value),
-                      },
-                    })
-                  }
-                  className="bg-slate-800 rounded px-2 py-1 w-20 text-right"
-                />
-              </label>
-              <label className="flex items-center justify-between gap-2 mb-1">
-                <span>腕部发力角(100分)</span>
-                <input
-                  type="number"
-                  value={cfg.targets.armPower}
-                  onChange={(e) =>
-                    handleCfgChange({
-                      targets: {
-                        ...cfg.targets,
-                        armPower: Number(e.target.value),
-                      },
-                    })
-                  }
-                  className="bg-slate-800 rounded px-2 py-1 w-20 text-right"
-                />
-              </label>
-              <label className="flex items-center justify-between gap-2 mb-1">
-                <span>随挥保持(s)</span>
-                <input
-                  type="number"
-                  value={cfg.targets.followDuration}
-                  onChange={(e) =>
-                    handleCfgChange({
-                      targets: {
-                        ...cfg.targets,
-                        followDuration: Number(e.target.value),
-                      },
-                    })
-                  }
-                  className="bg-slate-800 rounded px-2 py-1 w-20 text-right"
-                />
-              </label>
-              <label className="flex items-center justify-between gap-2 mb-1">
-                <span>肘部路径紧凑(≤%给满)</span>
-                <input
-                  type="number"
-                  value={cfg.targets.elbowCompactPct}
-                  onChange={(e) =>
-                    handleCfgChange({
-                      targets: {
-                        ...cfg.targets,
-                        elbowCompactPct: Number(e.target.value),
-                      },
-                    })
-                  }
-                  className="bg-slate-800 rounded px-2 py-1 w-20 text-right"
-                />
-              </label>
+            <div className="flex justify-between items-center gap-2">
+              <span>平滑强度</span>
+              <span className="text-slate-300 text-xs">
+                OneEuro ({analyzeConfig.filter.minCutoff} / {analyzeConfig.filter.beta})
+              </span>
             </div>
-
-            {/* 平衡 */}
-            <div>
-              <div className="font-semibold mb-1">平衡</div>
-              <label className="flex items-center justify-between gap-2 mb-1">
-                <span>重心偏移 % (100分)</span>
-                <input
-                  type="number"
-                  value={cfg.targets.centerOffsetPct}
-                  onChange={(e) =>
-                    handleCfgChange({
-                      targets: {
-                        ...cfg.targets,
-                        centerOffsetPct: Number(e.target.value),
-                      },
-                    })
-                  }
-                  className="bg-slate-800 rounded px-2 py-1 w-20 text-right"
-                />
-              </label>
-              <label className="flex items-center justify-between gap-2 mb-1">
-                <span>重心偏移 % (0分)</span>
-                <input
-                  type="number"
-                  value={cfg.targets.centerOffsetMaxPct}
-                  onChange={(e) =>
-                    handleCfgChange({
-                      targets: {
-                        ...cfg.targets,
-                        centerOffsetMaxPct: Number(e.target.value),
-                      },
-                    })
-                  }
-                  className="bg-slate-800 rounded px-2 py-1 w-20 text-right"
-                />
-              </label>
-              <label className="flex items-center justify-between gap-2 mb-1">
-                <span>对齐角度° (100分)</span>
-                <input
-                  type="number"
-                  value={cfg.targets.alignDeg}
-                  onChange={(e) =>
-                    handleCfgChange({
-                      targets: {
-                        ...cfg.targets,
-                        alignDeg: Number(e.target.value),
-                      },
-                    })
-                  }
-                  className="bg-slate-800 rounded px-2 py-1 w-20 text-right"
-                />
-              </label>
-              <label className="flex items-center justify-between gap-2 mb-1">
-                <span>对齐角度° (0分)</span>
-                <input
-                  type="number"
-                  value={cfg.targets.alignMaxDeg}
-                  onChange={(e) =>
-                    handleCfgChange({
-                      targets: {
-                        ...cfg.targets,
-                        alignMaxDeg: Number(e.target.value),
-                      },
-                    })
-                  }
-                  className="bg-slate-800 rounded px-2 py-1 w-20 text-right"
-                />
-              </label>
+            <div className="flex justify-between items-center gap-2">
+              <span>姿态阈值</span>
+              <span className="text-slate-300 text-xs">
+                {analyzeConfig.minScore.toFixed(2)}
+              </span>
             </div>
+            <p className="text-slate-500 text-xs">
+              这些配置现在先存在前端；你要做「每个子项 100 分对应哪一个实际值」，
+              只要把这里的值传给你的 scoring.ts，在计算分数的时候用上就行。
+            </p>
           </div>
-
-          <p className="text-slate-500 text-xs mt-3">
-            这些配置现在是在前端生效的，调完立刻影响下一帧的评分；以后你要做“按人保存配置”再把这个对象发回后端即可。
-          </p>
         </div>
       ) : null}
     </div>
