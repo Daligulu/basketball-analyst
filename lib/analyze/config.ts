@@ -2,7 +2,8 @@
 // 前端可调的分析配置，全放这里。
 // VideoAnalyzer 会把它存到 localStorage，改完马上生效。
 
-// ====== 阈值类型 ======
+// ------------------ 基础类型 ------------------
+
 export type AnalyzeThresholds = {
   lower: {
     squat100: number;     // 下蹲膝角达到这个就是 100 分，角度越小越好
@@ -15,12 +16,11 @@ export type AnalyzeThresholds = {
     elbowTight100: number;   // 肘部路径偏差在这个百分比以内给 100
   };
   balance: {
-    center100: number;   // 重心横向偏移小于这个百分比，100
-    align100: number;    // 躯干/脚尖对齐角
+    center100: number;       // 重心横向偏移(%) ≤ 这个给 100
+    align100: number;        // 躯干-脚尖 夹角 ≤ 这个给 100
   };
 };
 
-// ====== 姿态模型相关 ======
 export type PoseConfig = {
   modelComplexity: 'lite' | 'full';
   smoothMinCutoff: number;
@@ -28,38 +28,59 @@ export type PoseConfig = {
   kpMinScore: number;
 };
 
-// ====== 有些版本的代码用的是这个结构 ======
+// 这是线上版 VideoAnalyzer.tsx 已经在用的字段
 export type PoseSmoothingConfig = {
   minCutoff: number;
   beta: number;
   dCutoff: number;
 };
 
-// ====== 总配置 ======
+// 线上那份代码里出现的是 analyzeConfig.model
+// 我们就直接按它的叫法给出来
+export type PoseModel = 'mediapipe-full' | 'mediapipe-lite';
+
+// ------------------ 总配置 ------------------
+
 export type AnalyzeConfig = {
-  // 我们这份项目里本来就有的
+  // ⭐ 线上版需要的字段
+  model: PoseModel;
+
+  // ⭐ zip 版本里用的字段
   pose: PoseConfig;
-  // 你 Vercel 那份代码里 VideoAnalyzer.tsx 用到的
+
+  // ⭐ 线上版里用的字段
   poseSmoothing: PoseSmoothingConfig;
+
   thresholds: AnalyzeThresholds;
+
+  // 给将来/别的分支撑个兜底
+  [key: string]: unknown;
 };
 
+// ------------------ 默认配置（这次的重点改动也在这） ------------------
+
 export const DEFAULT_ANALYZE_CONFIG: AnalyzeConfig = {
+  // 线上版用来判断 new Pose(...) 里 modelComplexity 的
+  model: 'mediapipe-full',
+
+  // 本地(zip)版一直都有的
   pose: {
     modelComplexity: 'full',
     smoothMinCutoff: 1.15,
     smoothBeta: 0.05,
     kpMinScore: 0.35,
   },
-  // 跟 pose 里的平滑参数保持一致，这样两个写法都能用
+
+  // 给线上版的 engineRef / PoseCtor 用的平滑参数
   poseSmoothing: {
     minCutoff: 1.15,
     beta: 0.05,
     dCutoff: 1.0,
   },
+
   thresholds: {
     lower: {
-      squat100: 150,     // 库里原视频膝角差不多 150~160
+      squat100: 150,
       kneeExt100: 260,
     },
     upper: {
@@ -68,18 +89,20 @@ export const DEFAULT_ANALYZE_CONFIG: AnalyzeConfig = {
       follow100: 0.4,
       elbowTight100: 2,
     },
-    // ⭐⭐ 本次真正要改的地方：放宽平衡的容差 ⭐⭐
+    // ⭐⭐ 本次要放宽的地方 ⭐⭐
     balance: {
-      // 原来是 1 和 2，太严了，手机一拍就是 0 分
-      center100: 35,  // 重心横向偏到身体宽度的 35% 内都给 100
-      align100: 30,   // 躯干与脚方向 30° 内都给 100
+      // 原始代码是 center100: 1, align100: 2 导致你截图里两个都是 0
+      // 放到日常手机拍摄能接受的范围
+      center100: 35,  // 横向偏到 35% 身体宽度内算 100 分
+      align100: 30,   // 躯干和脚方向在 30° 内算 100 分
     },
   },
 };
 
 const STORAGE_KEY = 'basketball-analyze-config-v1';
 
-// 做一层安全的合并，兼容老数据 & 老字段名
+// ------------------ 读取（带兼容） ------------------
+
 export function loadAnalyzeConfig(): AnalyzeConfig {
   if (typeof window === 'undefined') {
     return DEFAULT_ANALYZE_CONFIG;
@@ -92,42 +115,42 @@ export function loadAnalyzeConfig(): AnalyzeConfig {
     }
 
     const parsed = JSON.parse(raw) as Partial<AnalyzeConfig> & {
-      // 兼容有些老版本只存了 pose 或只存了 poseSmoothing
+      // 老版本里可能只有 pose / 没有 poseSmoothing / 没有 model
       pose?: Partial<PoseConfig>;
       poseSmoothing?: Partial<PoseSmoothingConfig>;
+      model?: PoseModel;
     };
 
-    // ① 先把 pose 补全
+    // 1) 先合并 pose
     const mergedPose: PoseConfig = {
       ...DEFAULT_ANALYZE_CONFIG.pose,
       ...(parsed.pose ?? {}),
     };
 
-    // ② 再把 poseSmoothing 补全（两个方向都兼容）
-    // 情况 A：老版本只有 pose → 从 pose 里抄数
-    // 情况 B：老版本只有 poseSmoothing → 下面也能吃
+    // 2) 再合并 poseSmoothing
     const mergedPoseSmoothing: PoseSmoothingConfig = {
       ...DEFAULT_ANALYZE_CONFIG.poseSmoothing,
       ...(parsed.poseSmoothing ?? {}),
     };
 
-    // 如果只有 pose，没有 poseSmoothing，就从 pose 里同步一次
+    // 2.1 老数据只有 pose，没有 poseSmoothing → 从 pose 里抄一份
     if (!parsed.poseSmoothing && parsed.pose) {
       mergedPoseSmoothing.minCutoff =
         parsed.pose.smoothMinCutoff ?? mergedPoseSmoothing.minCutoff;
-      mergedPoseSmoothing.beta = parsed.pose.smoothBeta ?? mergedPoseSmoothing.beta;
-      // dCutoff 一般没存，就用默认的 1.0
+      mergedPoseSmoothing.beta =
+        parsed.pose.smoothBeta ?? mergedPoseSmoothing.beta;
+      // dCutoff 没有就用默认的 1.0
     }
 
-    // 反过来：如果只有 poseSmoothing，没有 pose，就也同步一下
+    // 2.2 反方向：只有 poseSmoothing，没有 pose → 同步到 pose
     if (!parsed.pose && parsed.poseSmoothing) {
       mergedPose.smoothMinCutoff =
         parsed.poseSmoothing.minCutoff ?? mergedPose.smoothMinCutoff;
-      mergedPose.smoothBeta = parsed.poseSmoothing.beta ?? mergedPose.smoothBeta;
-      // kpMinScore 就保持默认
+      mergedPose.smoothBeta =
+        parsed.poseSmoothing.beta ?? mergedPose.smoothBeta;
     }
 
-    // ③ 阈值合并
+    // 3) 合并 thresholds
     const mergedThresholds: AnalyzeThresholds = {
       ...DEFAULT_ANALYZE_CONFIG.thresholds,
       ...(parsed.thresholds ?? {}),
@@ -145,17 +168,28 @@ export function loadAnalyzeConfig(): AnalyzeConfig {
       },
     };
 
-    // ④ ⭐ 我们要的关键兜底：如果本地还存着旧的 1 / 2，就强制提到新值
-    if (mergedThresholds.balance.center100 < DEFAULT_ANALYZE_CONFIG.thresholds.balance.center100) {
+    // 4) ⭐ 关键兜底：如果本地还存着老的 1 / 2，就自动抬到我们这次的放宽值
+    if (
+      mergedThresholds.balance.center100 <
+      DEFAULT_ANALYZE_CONFIG.thresholds.balance.center100
+    ) {
       mergedThresholds.balance.center100 =
         DEFAULT_ANALYZE_CONFIG.thresholds.balance.center100;
     }
-    if (mergedThresholds.balance.align100 < DEFAULT_ANALYZE_CONFIG.thresholds.balance.align100) {
+    if (
+      mergedThresholds.balance.align100 <
+      DEFAULT_ANALYZE_CONFIG.thresholds.balance.align100
+    ) {
       mergedThresholds.balance.align100 =
         DEFAULT_ANALYZE_CONFIG.thresholds.balance.align100;
     }
 
+    // 5) ⭐ 线上版需要的 model，没有就给默认的
+    const mergedModel: PoseModel =
+      parsed.model ?? DEFAULT_ANALYZE_CONFIG.model;
+
     return {
+      model: mergedModel,
       pose: mergedPose,
       poseSmoothing: mergedPoseSmoothing,
       thresholds: mergedThresholds,
@@ -165,6 +199,8 @@ export function loadAnalyzeConfig(): AnalyzeConfig {
     return DEFAULT_ANALYZE_CONFIG;
   }
 }
+
+// ------------------ 保存 ------------------
 
 export function saveAnalyzeConfig(cfg: AnalyzeConfig) {
   if (typeof window === 'undefined') return;
