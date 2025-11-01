@@ -1,61 +1,109 @@
 // lib/pose/oneEuro2d.ts
-// 一个非常轻量的 2D One Euro 滤波器，够用就行，重点是要把 OneEuroConfig 导出去，给 poseEngine.ts 用
+// 一个非常轻量的 One Euro Filter，实现 2D 点平滑，完全跑在前端
+// 主要用来消掉 Mediapipe 偶尔的抖点，给姿态线条稳定一点的视觉效果
 
-export type OneEuroConfig = {
-  /** 越大越“稳”，但越跟不上快速动作 */
-  minCutoff: number;
-  /** 越大越能快速跟随加速度变化 */
-  beta: number;
-  /** 导数的 cutoff，一般 1.0 就够 */
-  dCutoff: number;
-};
+export interface OneEuroConfig {
+  minCutoff: number; // 默认 1.0~1.2
+  beta: number; // 默认 0.0~0.1
+  dCutoff: number; // 默认 1.0
+}
 
-/**
- * 一个最简单的 1-euro 思路的 2D 平滑器
- * 这里只做前端渲染级别的平滑，不是科研级实现
- */
-export class OneEuro2D {
-  private cfg: OneEuroConfig;
-  private lastX: number | null = null;
-  private lastY: number | null = null;
-  private lastT: number | null = null;
+class LowPassFilter {
+  private y: number;
+  private a: number;
+  private s: boolean;
 
-  constructor(cfg: OneEuroConfig) {
-    this.cfg = cfg;
+  constructor(alpha: number, initValue: number) {
+    this.y = initValue;
+    this.a = alpha;
+    this.s = false;
   }
 
-  /**
-   * @param x 原始 x (像素)
-   * @param y 原始 y (像素)
-   * @param t 当前时间，ms
-   */
-  next(x: number, y: number, t: number) {
-    // 第一次就直接收下
-    if (this.lastX === null || this.lastY === null || this.lastT === null) {
-      this.lastX = x;
-      this.lastY = y;
-      this.lastT = t;
-      return { x, y };
+  filter(value: number, alpha: number): number {
+    if (!this.s) {
+      this.y = value;
+      this.s = true;
+      return value;
+    }
+    this.a = alpha;
+    this.y = this.a * value + (1 - this.a) * this.y;
+    return this.y;
+  }
+
+  lastValue() {
+    return this.y;
+  }
+}
+
+function smoothingFactor(t_e: number, cutoff: number): number {
+  const r = 2 * Math.PI * cutoff * t_e;
+  return r / (r + 1);
+}
+
+function exponentialSmoothing(a: number, x: number, xPrev: number): number {
+  return a * x + (1 - a) * xPrev;
+}
+
+class OneEuroFilter {
+  private freq: number;
+  private minCutoff: number;
+  private beta: number;
+  private dCutoff: number;
+  private x: LowPassFilter | null;
+  private dx: LowPassFilter | null;
+  private lastTime: number | null;
+
+  constructor(freq: number, minCutoff: number, beta: number, dCutoff: number) {
+    this.freq = freq;
+    this.minCutoff = minCutoff;
+    this.beta = beta;
+    this.dCutoff = dCutoff;
+    this.x = null;
+    this.dx = null;
+    this.lastTime = null;
+  }
+
+  filter(t: number, value: number): number {
+    if (this.lastTime != null && t !== this.lastTime) {
+      this.freq = 1.0 / (t - this.lastTime);
+    }
+    this.lastTime = t;
+
+    if (!this.dx) {
+      this.dx = new LowPassFilter(1, 0.0);
+    }
+    const dValue = this.dx.filter(
+      this.freq ? (value - (this.x ? this.x.lastValue() : value)) * this.freq : 0.0,
+      smoothingFactor(1.0 / this.freq, this.dCutoff),
+    );
+
+    const cutoff = this.minCutoff + this.beta * Math.abs(dValue);
+
+    if (!this.x) {
+      this.x = new LowPassFilter(1, value);
     }
 
-    // 计算 dt，防止 0
-    const dtMs = t - this.lastT;
-    const dt = dtMs <= 0 ? 0.016 : dtMs / 1000; // s
-    this.lastT = t;
+    return this.x.filter(value, smoothingFactor(1.0 / this.freq, cutoff));
+  }
+}
 
-    // 一个很简化的 alpha 计算：没走全 1-euro 的公式，只要有个“越大越快”的感觉
-    const { minCutoff, beta } = this.cfg;
-    const speed = Math.hypot(x - this.lastX, y - this.lastY) / Math.max(dt, 1e-6);
-    const cutoff = minCutoff + beta * speed;
-    // clamp 一下，避免 0
-    const alpha = cutoff <= 0 ? 1 : 1 / (1 + cutoff);
+// 真正对 (x, y) 做平滑的这个类
+export class OneEuro2D {
+  private fx: OneEuroFilter;
+  private fy: OneEuroFilter;
 
-    const nx = this.lastX + alpha * (x - this.lastX);
-    const ny = this.lastY + alpha * (y - this.lastY);
+  constructor(cfg: OneEuroConfig) {
+    const minCutoff = cfg.minCutoff ?? 1.15;
+    const beta = cfg.beta ?? 0.0;
+    const dCutoff = cfg.dCutoff ?? 1.0;
+    // 初始频率随便给个 60
+    this.fx = new OneEuroFilter(60, minCutoff, beta, dCutoff);
+    this.fy = new OneEuroFilter(60, minCutoff, beta, dCutoff);
+  }
 
-    this.lastX = nx;
-    this.lastY = ny;
-
+  filter(x: number, y: number, t: number): { x: number; y: number } {
+    const nx = this.fx.filter(t, x);
+    const ny = this.fy.filter(t, y);
     return { x: nx, y: ny };
   }
 }
