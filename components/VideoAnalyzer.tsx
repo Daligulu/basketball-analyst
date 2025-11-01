@@ -86,7 +86,7 @@ export default function VideoAnalyzer() {
     setScores(INITIAL_SCORE);
   };
 
-  // 视频元数据加载完以后，同步 canvas 宽高
+  // 视频元数据加载完以后，拿到真正的宽高
   const handleLoadedMetadata = () => {
     const vid = videoRef.current;
     const cvs = canvasRef.current;
@@ -105,7 +105,7 @@ export default function VideoAnalyzer() {
     await videoRef.current.play();
     setIsAnalyzing(true);
 
-    // 这里先放一份固定的假数据，保证 UI 有内容
+    // 临时写死一份得分
     setScores({
       total: 78,
       lower: {
@@ -128,7 +128,7 @@ export default function VideoAnalyzer() {
     });
   };
 
-  // 每帧的姿态绘制
+  // 姿态绘制
   const drawPose = useCallback(async () => {
     const vid = videoRef.current;
     const cvs = canvasRef.current;
@@ -137,16 +137,14 @@ export default function VideoAnalyzer() {
     const ctx = cvs.getContext('2d');
     if (!ctx) return;
 
-    // 清画布，避免残影
+    // 每帧先清一下
     ctx.clearRect(0, 0, cvs.width, cvs.height);
 
-    // 我们暂时从 globalThis 拿模型输出
-    // 真正接上 TF.js / mediapipe / 你们自己 worker 的时候，把这一行换成真实的检测结果就行
+    // 从全局拿这一帧的多人体姿态（你之后要接真正的 detector，就把这里换掉）
     const det: any =
       (typeof globalThis !== 'undefined' && (globalThis as any).__lastPoseFrame__) || null;
 
     if (!det || !Array.isArray(det)) {
-      // 没有检测出来任何人，这一帧就只保持清空
       return;
     }
 
@@ -155,15 +153,12 @@ export default function VideoAnalyzer() {
       ts: performance.now(),
     };
 
-    // 这里就是这次报错的点：engine.process 可能返回 null，要按可能为 null 处理
     const person = engine.process(frame);
-
     if (!person) {
-      // 这一帧没选到合格的前景人
       return;
     }
 
-    const radius = 3; // 你之前要的 1/2 大小
+    const radius = 3;
     const minScore = 0.28;
 
     // 画点
@@ -172,7 +167,6 @@ export default function VideoAnalyzer() {
       if ((kp.score ?? 0) < minScore) continue;
 
       let color = LOWER_COLOR;
-
       if (
         kp.name === 'left_shoulder' ||
         kp.name === 'right_shoulder' ||
@@ -192,7 +186,6 @@ export default function VideoAnalyzer() {
       ) {
         color = LOWER_COLOR;
       } else {
-        // 头 + 上肢
         color = UPPER_COLOR;
       }
 
@@ -210,7 +203,7 @@ export default function VideoAnalyzer() {
       if (!a || !b) continue;
       if ((a.score ?? 0) < minScore || (b.score ?? 0) < minScore) continue;
 
-      // 防止你之前遇到的“连到背景人物”的现象：线太长就丢掉
+      // 防止跨背景
       const dist = Math.hypot(a.x - b.x, a.y - b.y);
       const maxLen = Math.min(cvs.width, cvs.height) * 0.6;
       if (dist > maxLen) continue;
@@ -380,7 +373,7 @@ export default function VideoAnalyzer() {
                 <span className="text-slate-400">({scores.upper.follow.value})</span>
               </span>
             </div>
-            <div className="flex justify-between">
+            <div className="flex justify之间">
               <span>肘部路径紧凑</span>
               <span>
                 {scores.upper.elbowTight.score}{' '}
@@ -428,7 +421,7 @@ export default function VideoAnalyzer() {
             </button>
           </div>
           <p className="text-slate-400 text-sm">
-            这里可以放「检测模型选择」「平滑强度」「评分阈值」等选项，先留占位，保证和原项目布局一致。
+            这里可以放「检测模型选择」「平滑强度」「评分阈值」等选项，先留占位。
           </p>
         </div>
       ) : null}
